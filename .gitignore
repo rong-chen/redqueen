@@ -1,0 +1,19 @@
+# Binaries
+server
+RedQueenSystem
+
+# Models (large files)
+models/asr/**/*.onnx
+
+# Node modules
+admin-ui/node_modules/
+
+# Database
+*.db
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
