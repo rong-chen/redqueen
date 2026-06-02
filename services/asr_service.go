@@ -106,6 +106,15 @@ func (s *ASRStream) FeedAudio(pcmData []byte) {
 	s.stream.AcceptWaveform(16000, samples)
 }
 
+// FeedSamples 直接将 16-bit PCM 采样数组喂入识别流，避免中介 []byte 转换
+func (s *ASRStream) FeedSamples(samples []int16) {
+	floatSamples := make([]float32, len(samples))
+	for i, v := range samples {
+		floatSamples[i] = float32(v) / 32768.0
+	}
+	s.stream.AcceptWaveform(16000, floatSamples)
+}
+
 // Decode 处理识别流中已缓冲的全部音频帧
 func (s *ASRStream) Decode() {
 	for s.recognizer.IsReady(s.stream) {

@@ -2,7 +2,6 @@ package services
 
 import (
 	"errors"
-	"fmt"
 
 	"RedQueenSystem/database"
 	"RedQueenSystem/models"
@@ -67,24 +66,19 @@ func (s *VoiceService) ProcessIntent(command *models.VoiceCommand) {
 		intent = parseResult.Intent
 		confidence = parseResult.Confidence
 
-		// 2. 如果是外部注册的 MCP 工具调用，则动态转发执行
+		// 2. 如果是外部注册的 MCP 工具调用，则根据第一轮已执行的状态返回，避免二次执行
 		if parseResult.IsExternal {
-			_, _, toolToServerMap := GetExternalMCPTools()
-			srv, exists := toolToServerMap[parseResult.ExternalToolName]
-			if !exists {
+			if parseResult.ToolStatus == "failed" {
 				status = "failed"
-				errMessage = fmt.Sprintf("未在后台找到执行工具 [%s] 的在线 MCP 服务器", parseResult.ExternalToolName)
+				errMessage = "外部工具执行失败: " + parseResult.ToolError
 			} else {
-				_, err := CallExternalMCPTool(srv, parseResult.ExternalToolName, parseResult.ExternalArguments)
-				if err != nil {
-					status = "failed"
-					errMessage = "外部 MCP 工具执行失败: " + err.Error()
-				}
+				status = "success"
 			}
 		} else if parseResult.Intent == "unknown" && parseResult.ReplyText == "" {
 			status = "failed"
 			errMessage = "无法识别或匹配对应的指令意图"
 		}
+
 	}
 
 	// 3. 更新解析和物理控制结果至数据库交互记录中

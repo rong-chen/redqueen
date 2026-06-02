@@ -1,7 +1,8 @@
 package controllers
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"gopkg.in/hraban/opus.v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -47,13 +49,15 @@ type WSMessage struct {
 
 // WakeEvent 表示一个设备的唤醒事件，用于仲裁
 type WakeEvent struct {
-	RoomID    string
-	Volume    float64
-	Action    services.SessionAction
-	Conn      *websocket.Conn
-	WriteMu   *sync.Mutex
-	Session   *services.Session
-	Timestamp time.Time
+	RoomID      string
+	Volume      float64
+	Action      services.SessionAction
+	Conn        *websocket.Conn
+	WriteMu     *sync.Mutex
+	Session     *services.Session
+	Timestamp   time.Time
+	Codec       string
+	OpusEncoder *opus.Encoder
 }
 
 // VoiceArbitrator 负责处理多台设备同时被唤醒时的冲突消解
@@ -104,7 +108,7 @@ func (a *VoiceArbitrator) Resolve(ctrl *VoiceWSController) {
 		winner.RoomID, winner.Volume, len(events)-1)
 
 	// 2. 激活并响应获胜的设备
-	ctrl.handleSessionAction(winner.Conn, winner.WriteMu, winner.Action)
+	ctrl.handleSessionAction(winner.Conn, winner.WriteMu, winner.Action, winner.Codec, winner.OpusEncoder, winner.RoomID)
 
 	// 3. 对所有失败的竞争者，强行使其重回休眠态，并通知客户端
 	for _, e := range events {
@@ -159,6 +163,7 @@ func calculateVolume(pcmData []byte) float64 {
 type VoiceWSController struct {
 	wakeWord       string
 	sessionTimeout time.Duration
+	activeCancels  sync.Map // Map[string]context.CancelFunc (RoomID -> cancel)
 }
 
 // NewVoiceWSController 实例化 WebSocket 语音控制器
@@ -170,6 +175,22 @@ func NewVoiceWSController(wakeWord string, sessionTimeoutSec int) *VoiceWSContro
 	return &VoiceWSController{
 		wakeWord:       wakeWord,
 		sessionTimeout: timeout,
+	}
+}
+
+// interruptPlayback 强行中断指定房间的活跃播放并通知客户端
+func (ctrl *VoiceWSController) interruptPlayback(conn *websocket.Conn, writeMu *sync.Mutex, roomID string) {
+	if val, ok := ctrl.activeCancels.Load(roomID); ok {
+		if cancel, ok := val.(context.CancelFunc); ok {
+			cancel()
+			log.Printf("【打断机制】成功中断房间 [%s] 的当前语音输出", roomID)
+		}
+		ctrl.activeCancels.Delete(roomID)
+		// 通知客户端播放已被打断
+		ctrl.sendMessage(conn, writeMu, WSMessage{
+			Type:    "interrupt",
+			Message: "playback_interrupted",
+		})
 	}
 }
 
@@ -206,7 +227,30 @@ func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
 		room = "client_" + time.Now().Format("150405.000")
 	}
 
-	log.Printf("【WebSocket】新的语音连接已建立, 房间: %s", room)
+	codec := c.DefaultQuery("codec", "pcm")
+	log.Printf("【WebSocket】新的语音连接已建立, 房间: %s, 编码格式: %s", room, codec)
+
+	// 初始化 Opus 编解码器（仅在选用 opus 时）
+	var opusDecoder *opus.Decoder
+	var opusEncoder *opus.Encoder
+	if codec == "opus" {
+		dec, err := opus.NewDecoder(16000, 1)
+		if err != nil {
+			log.Printf("【WebSocket】初始化 Opus 解码器失败: %v", err)
+			ctrl.sendMessage(conn, &writeMu, WSMessage{Type: "error", Message: "Opus decoder init failed"})
+			return
+		}
+		opusDecoder = dec
+
+		enc, err := opus.NewEncoder(16000, 1, opus.AppVoIP)
+		if err != nil {
+			log.Printf("【WebSocket】初始化 Opus 编码器失败: %v", err)
+			ctrl.sendMessage(conn, &writeMu, WSMessage{Type: "error", Message: "Opus encoder init failed"})
+			return
+		}
+		_ = enc.SetComplexity(1) // 适合嵌入式/低算力设备的高效参数
+		opusEncoder = enc
+	}
 
 	// 3. 创建该连接专用的 ASR 识别流
 	stream := asr.NewStream()
@@ -241,8 +285,8 @@ func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
 
 		switch messageType {
 		case websocket.BinaryMessage:
-			// 二进制帧 = PCM 音频数据
-			ctrl.processAudioFrame(conn, &writeMu, stream, session, data)
+			// 二进制帧 = PCM / Opus 音频数据
+			ctrl.processAudioFrame(conn, &writeMu, stream, session, data, codec, opusDecoder, opusEncoder)
 
 		case websocket.TextMessage:
 			// 文本帧 = 控制指令（如手动唤醒/休眠）
@@ -257,25 +301,50 @@ func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
 // 音频处理核心逻辑
 // ---------------------------------------------------------------------------
 
-// processAudioFrame 处理一帧 PCM 音频数据
+// processAudioFrame 处理一帧 PCM 或 Opus 音频数据
 func (ctrl *VoiceWSController) processAudioFrame(
 	conn *websocket.Conn,
 	writeMu *sync.Mutex,
 	stream *services.ASRStream,
 	session *services.Session,
 	pcmData []byte,
+	codec string,
+	opusDecoder *opus.Decoder,
+	opusEncoder *opus.Encoder,
 ) {
-	// 数据校验：PCM 16-bit 要求字节数为偶数
-	if len(pcmData) < 2 || len(pcmData)%2 != 0 {
-		return
+	var vol float64
+
+	// 1. 根据编码格式进行数据解析与音量计算
+	if codec == "opus" {
+		if opusDecoder == nil {
+			return
+		}
+		// 每次 20ms @ 16kHz 为 320 采样点，使用 1024 大小缓冲区绰绰有余
+		pcmBuf := make([]int16, 1024)
+		n, err := opusDecoder.Decode(pcmData, pcmBuf)
+		if err != nil {
+			log.Printf("【ASR】Opus 音频帧解码失败: %v", err)
+			return
+		}
+		if n <= 0 {
+			return
+		}
+		vol = calculateVolumeSamples(pcmBuf[:n])
+		session.UpdateVolume(vol)
+
+		// 2. 直接将解码出的采样喂入 ASR
+		stream.FeedSamples(pcmBuf[:n])
+	} else {
+		// 数据校验：PCM 16-bit 要求字节数为偶数
+		if len(pcmData) < 2 || len(pcmData)%2 != 0 {
+			return
+		}
+		vol = calculateVolume(pcmData)
+		session.UpdateVolume(vol)
+
+		// 2. 将 PCM 音频喂入 Sherpa-onnx 识别引擎
+		stream.FeedAudio(pcmData)
 	}
-
-	// 1. 计算音量并平滑更新当前会话的最大音量
-	vol := calculateVolume(pcmData)
-	session.UpdateVolume(vol)
-
-	// 2. 将 PCM 音频喂入 Sherpa-onnx 识别引擎
-	stream.FeedAudio(pcmData)
 
 	// 3. 执行解码（处理缓冲区中的所有就绪帧）
 	stream.Decode()
@@ -283,6 +352,12 @@ func (ctrl *VoiceWSController) processAudioFrame(
 	// 4. 获取实时中间识别结果
 	partialText := stream.GetResult()
 	if partialText != "" {
+		// 【打断机制】当正在播放大模型音频时，若 ASR 检测到非空中间文字，瞬间打断
+		if _, ok := ctrl.activeCancels.Load(session.RoomID); ok {
+			log.Printf("【打断机制】检测到用户说话 (ASR 中间文字: \"%s\")，即刻终止当前播放！", partialText)
+			ctrl.interruptPlayback(conn, writeMu, session.RoomID)
+		}
+
 		ctrl.sendMessage(conn, writeMu, WSMessage{
 			Type: "partial",
 			Text: partialText,
@@ -306,24 +381,29 @@ func (ctrl *VoiceWSController) processAudioFrame(
 			Text: finalText,
 		})
 
+		// 【打断机制】如果是在 ASR 最终确定时仍有播放活动，也进行最终二次打断清理
+		ctrl.interruptPlayback(conn, writeMu, session.RoomID)
+
 		// 6. 通过会话状态机判断该如何处理
 		action := session.ProcessText(finalText)
 
 		// 7. 多设备协同唤醒仲裁
 		if action.Type == services.ActionWake || action.Type == services.ActionWakeAndExecute {
 			event := &WakeEvent{
-				RoomID:    session.RoomID,
-				Volume:    session.GetMaxVolume(),
-				Action:    action,
-				Conn:      conn,
-				WriteMu:   writeMu,
-				Session:   session,
-				Timestamp: time.Now(),
+				RoomID:      session.RoomID,
+				Volume:      session.GetMaxVolume(),
+				Action:      action,
+				Conn:        conn,
+				WriteMu:     writeMu,
+				Session:     session,
+				Timestamp:   time.Now(),
+				Codec:       codec,
+				OpusEncoder: opusEncoder,
 			}
 			globalArbitrator.Submit(ctrl, event)
 		} else {
 			// 普通控制指令或休眠指令，无需仲裁，直接执行
-			ctrl.handleSessionAction(conn, writeMu, action)
+			ctrl.handleSessionAction(conn, writeMu, action, codec, opusEncoder, session.RoomID)
 		}
 	}
 }
@@ -337,6 +417,9 @@ func (ctrl *VoiceWSController) handleSessionAction(
 	conn *websocket.Conn,
 	writeMu *sync.Mutex,
 	action services.SessionAction,
+	codec string,
+	opusEncoder *opus.Encoder,
+	roomID string,
 ) {
 	switch action.Type {
 	case services.ActionIgnore:
@@ -351,7 +434,7 @@ func (ctrl *VoiceWSController) handleSessionAction(
 			Message: wakeMsg,
 		})
 		// 异步合成语音并推送给硬件设备扬声器
-		go ctrl.streamAudioToClient(conn, writeMu, wakeMsg)
+		go ctrl.streamAudioToClient(conn, writeMu, wakeMsg, codec, opusEncoder, roomID)
 
 	case services.ActionWakeAndExecute:
 		// 唤醒成功且附带指令（如 "皇后帮我开灯"）
@@ -360,12 +443,12 @@ func (ctrl *VoiceWSController) handleSessionAction(
 			Type:    "wake",
 			Message: "红皇后已唤醒，正在处理指令...",
 		})
-		ctrl.executeCommand(conn, writeMu, action.Command)
+		go ctrl.executeCommand(conn, writeMu, action.Command, codec, opusEncoder, roomID)
 
 	case services.ActionExecute:
 		// 激活态中收到指令
 		log.Printf("【会话】执行指令: %s", action.Command)
-		ctrl.executeCommand(conn, writeMu, action.Command)
+		go ctrl.executeCommand(conn, writeMu, action.Command, codec, opusEncoder, roomID)
 
 	case services.ActionSleep:
 		// 用户主动结束对话
@@ -376,7 +459,7 @@ func (ctrl *VoiceWSController) handleSessionAction(
 			Message: sleepMsg,
 		})
 		// 异步合成语音并推送给硬件设备扬声器
-		go ctrl.streamAudioToClient(conn, writeMu, sleepMsg)
+		go ctrl.streamAudioToClient(conn, writeMu, sleepMsg, codec, opusEncoder, roomID)
 	}
 }
 
@@ -386,7 +469,18 @@ func (ctrl *VoiceWSController) executeCommand(
 	conn *websocket.Conn,
 	writeMu *sync.Mutex,
 	command string,
+	codec string,
+	opusEncoder *opus.Encoder,
+	roomID string,
 ) {
+	// 【打断机制】创建可随时取消的 Context，并保存其 CancelFunc
+	ctx, cancel := context.WithCancel(context.Background())
+	ctrl.activeCancels.Store(roomID, cancel)
+	defer func() {
+		cancel()
+		ctrl.activeCancels.Delete(roomID)
+	}()
+
 	nlpSvc := services.NewNLPService()
 
 	// ---------------------------------------------------------------------------
@@ -396,7 +490,7 @@ func (ctrl *VoiceWSController) executeCommand(
 	if streamErr != nil {
 		// 流式调用失败，回退到传统同步模式
 		log.Printf("【流式管线】流式调用失败，回退同步模式: %v", streamErr)
-		ctrl.executeCommandSync(conn, writeMu, command)
+		ctrl.executeCommandSync(conn, writeMu, command, codec, opusEncoder, roomID, ctx)
 		return
 	}
 
@@ -418,6 +512,12 @@ func (ctrl *VoiceWSController) executeCommand(
 	sentenceEnders := "。！？；\n"
 
 	for chunk := range streamCh {
+		// 【打断检测】在接收大模型下一个 chunk 之前，检查当前是否已经被用户打断
+		if ctx.Err() != nil {
+			log.Println("【打断机制】检测到打断信号，主动终止 LLM 令牌循环")
+			return
+		}
+
 		// 处理错误
 		if chunk.Error != nil {
 			log.Printf("【流式管线】大模型流式输出错误: %v", chunk.Error)
@@ -472,8 +572,13 @@ func (ctrl *VoiceWSController) executeCommand(
 
 			// 首次合成时发送 audio_start 通知设备
 			if !audioStarted {
+				// 支持发送音频编码标头
+				audioMsg := "pcm_16k_16bit_mono"
+				if codec == "opus" {
+					audioMsg = "opus_16k_mono"
+				}
 				ctrl.sendMessage(conn, writeMu, WSMessage{
-					Type: "audio_start", Message: "pcm_16k_16bit_mono",
+					Type: "audio_start", Message: audioMsg,
 				})
 				audioStarted = true
 			}
@@ -486,7 +591,7 @@ func (ctrl *VoiceWSController) executeCommand(
 			}
 			if len(audioData) > 0 {
 				totalAudioLen += len(audioData)
-				ctrl.pushAudioChunks(conn, writeMu, audioData)
+				ctrl.pushAudioChunks(conn, writeMu, audioData, codec, opusEncoder, ctx)
 			}
 		}
 
@@ -496,7 +601,7 @@ func (ctrl *VoiceWSController) executeCommand(
 	}
 
 	// ---------------------------------------------------------------------------
-	// 处理工具调用（非流式场景：大模型选择了外部 MCP 工具）
+	// 处理工具调用（大模型命中外部 MCP 工具，执行后发起二阶段流式重生成）
 	// ---------------------------------------------------------------------------
 	var status, message, intent string
 	var confidence float64
@@ -504,30 +609,127 @@ func (ctrl *VoiceWSController) executeCommand(
 	if toolCallInfo != nil {
 		intent = "external_mcp_call"
 		confidence = 0.98
+
+		log.Printf("【流式管线】命中外部工具调用: %s | 参数: %s", toolCallInfo.Name, toolCallInfo.Arguments)
+
+		// 1. 发送提示给前端，表明正在执行外部工具
+		ctrl.sendMessage(conn, writeMu, WSMessage{
+			Type:    "stream_token",
+			Message: fmt.Sprintf("（正在执行外部工具 [%s]...）\n", toolCallInfo.Name),
+		})
+
+		// 2. 执行外部工具
 		_, _, toolToServerMap := services.GetExternalMCPTools()
 		srv, exists := toolToServerMap[toolCallInfo.Name]
+		var respText string
 		if !exists {
 			status = "failed"
-			message = fmt.Sprintf("未找到能够执行外部工具 [%s] 的 MCP 服务器", toolCallInfo.Name)
+			respText = fmt.Sprintf("未在后台找到执行工具 [%s] 的在线 MCP 服务器", toolCallInfo.Name)
 		} else {
-			respText, callErr := services.CallExternalMCPTool(srv, toolCallInfo.Name, toolCallInfo.Arguments)
+			var callErr error
+			respText, callErr = services.CallExternalMCPTool(srv, toolCallInfo.Name, toolCallInfo.Arguments)
 			if callErr != nil {
 				status = "failed"
-				message = fmt.Sprintf("外部 MCP 服务 [%s] 执行失败: %v", srv.Name, callErr)
+				respText = "工具执行出错: " + callErr.Error()
 			} else {
 				status = "success"
-				message = respText
 			}
 		}
 
-		// 工具调用结果的 TTS
-		if !audioStarted {
-			ctrl.sendMessage(conn, writeMu, WSMessage{Type: "audio_start", Message: "pcm_16k_16bit_mono"})
-			audioStarted = true
-		}
-		if audioData, err := ttsSvc.Synthesize(message); err == nil && len(audioData) > 0 {
-			totalAudioLen += len(audioData)
-			ctrl.pushAudioChunks(conn, writeMu, audioData)
+		log.Printf("【流式管线】工具执行完毕，状态: %s。发起第二轮流式性格重生成...", status)
+
+		// 3. 发起第二轮流式性格重生成
+		streamCh2, err := nlpSvc.GenerateStreamingToolReply(command, toolCallInfo.Name, toolCallInfo.Arguments, respText)
+		if err != nil {
+			log.Printf("【流式管线】第二轮流式性格重生成启动失败: %v", err)
+			message = "工具执行结果: " + respText
+			// 兜底：直接合成并推送原始工具回复
+			if !audioStarted {
+				audioMsg := "pcm_16k_16bit_mono"
+				if codec == "opus" {
+					audioMsg = "opus_16k_mono"
+				}
+				ctrl.sendMessage(conn, writeMu, WSMessage{Type: "audio_start", Message: audioMsg})
+				audioStarted = true
+			}
+			if audioData, err := ttsSvc.Synthesize(message); err == nil && len(audioData) > 0 {
+				totalAudioLen += len(audioData)
+				ctrl.pushAudioChunks(conn, writeMu, audioData, codec, opusEncoder, ctx)
+			}
+		} else {
+			// 清空之前的 buffers，开启二阶段流式渲染与 TTS
+			sentenceBuf.Reset()
+			fullReply.Reset()
+
+			for chunk := range streamCh2 {
+				// 【打断检测】
+				if ctx.Err() != nil {
+					log.Println("【打断机制】检测到打断信号，主动终止第二轮 LLM 令牌循环")
+					return
+				}
+
+				if chunk.Error != nil {
+					log.Printf("【流式管线】第二轮大模型流式输出错误: %v", chunk.Error)
+					break
+				}
+
+				if chunk.Token != "" {
+					sentenceBuf.WriteString(chunk.Token)
+					fullReply.WriteString(chunk.Token)
+
+					// 推送实时 token 给前端 UI
+					ctrl.sendMessage(conn, writeMu, WSMessage{
+						Type:    "stream_token",
+						Message: chunk.Token,
+					})
+				}
+
+				currentSentence := sentenceBuf.String()
+				shouldSynth := false
+
+				if chunk.Done {
+					shouldSynth = len(strings.TrimSpace(currentSentence)) > 0
+				} else if len(currentSentence) > 0 {
+					lastRune := []rune(currentSentence)
+					if len(lastRune) > 0 && strings.ContainsRune(sentenceEnders, lastRune[len(lastRune)-1]) {
+						shouldSynth = true
+					}
+					if !shouldSynth && len(lastRune) > 8 && strings.ContainsRune("，、,", lastRune[len(lastRune)-1]) {
+						shouldSynth = true
+					}
+				}
+
+				if shouldSynth && len(strings.TrimSpace(currentSentence)) > 0 {
+					sentence := strings.TrimSpace(currentSentence)
+					sentenceBuf.Reset()
+
+					if !audioStarted {
+						audioMsg := "pcm_16k_16bit_mono"
+						if codec == "opus" {
+							audioMsg = "opus_16k_mono"
+						}
+						ctrl.sendMessage(conn, writeMu, WSMessage{
+							Type: "audio_start", Message: audioMsg,
+						})
+						audioStarted = true
+					}
+
+					audioData, ttsErr := ttsSvc.Synthesize(sentence)
+					if ttsErr != nil {
+						log.Printf("【流式管线】第二轮句段 TTS 合成失败: %v (句段: %s)", ttsErr, sentence)
+						continue
+					}
+					if len(audioData) > 0 {
+						totalAudioLen += len(audioData)
+						ctrl.pushAudioChunks(conn, writeMu, audioData, codec, opusEncoder, ctx)
+					}
+				}
+			}
+
+			message = strings.TrimSpace(fullReply.String())
+			if message == "" {
+				message = "工具执行完毕，但生成回复为空"
+			}
 		}
 	} else {
 		intent = "conversation"
@@ -538,6 +740,7 @@ func (ctrl *VoiceWSController) executeCommand(
 			message = "无法识别该指令的意图"
 		}
 	}
+
 
 	// 发送 audio_end 通知设备恢复麦克风
 	if audioStarted {
@@ -561,6 +764,10 @@ func (ctrl *VoiceWSController) executeCommandSync(
 	conn *websocket.Conn,
 	writeMu *sync.Mutex,
 	command string,
+	codec string,
+	opusEncoder *opus.Encoder,
+	roomID string,
+	ctx context.Context,
 ) {
 	nlpSvc := services.NewNLPService()
 	parseResult, err := nlpSvc.ParseIntent(command)
@@ -576,20 +783,12 @@ func (ctrl *VoiceWSController) executeCommandSync(
 		intent = parseResult.Intent
 		confidence = parseResult.Confidence
 		if parseResult.IsExternal {
-			_, _, toolToServerMap := services.GetExternalMCPTools()
-			srv, exists := toolToServerMap[parseResult.ExternalToolName]
-			if !exists {
+			if parseResult.ToolStatus == "failed" {
 				status = "failed"
-				message = fmt.Sprintf("未找到能够执行外部工具 [%s] 的 MCP 服务器", parseResult.ExternalToolName)
+				message = "外部工具执行失败: " + parseResult.ToolError
 			} else {
-				respText, callErr := services.CallExternalMCPTool(srv, parseResult.ExternalToolName, parseResult.ExternalArguments)
-				if callErr != nil {
-					status = "failed"
-					message = fmt.Sprintf("外部 MCP 服务 [%s] 执行失败: %v", srv.Name, callErr)
-				} else {
-					status = "success"
-					message = respText
-				}
+				status = "success"
+				message = parseResult.ReplyText
 			}
 		} else {
 			status = "success"
@@ -599,6 +798,7 @@ func (ctrl *VoiceWSController) executeCommandSync(
 				message = "无法识别该指令的意图"
 			}
 		}
+
 	}
 
 	voiceSvc := services.NewVoiceService()
@@ -607,7 +807,7 @@ func (ctrl *VoiceWSController) executeCommandSync(
 	ctrl.sendMessage(conn, writeMu, WSMessage{
 		Type: "result", Intent: intent, Status: status, Message: message,
 	})
-	go ctrl.streamAudioToClient(conn, writeMu, message)
+	go ctrl.streamAudioToClient(conn, writeMu, message, codec, opusEncoder, roomID, ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -627,16 +827,20 @@ func (ctrl *VoiceWSController) processControlMessage(
 	case "wake":
 		// 手动唤醒（调试用）
 		action := session.ProcessText(session.WakeWord)
-		ctrl.handleSessionAction(conn, writeMu, action)
+		ctrl.handleSessionAction(conn, writeMu, action, "pcm", nil, session.RoomID)
 	case "sleep":
 		// 手动休眠
 		action := session.ProcessText("好了")
-		ctrl.handleSessionAction(conn, writeMu, action)
+		ctrl.handleSessionAction(conn, writeMu, action, "pcm", nil, session.RoomID)
 	case "ping":
 		ctrl.sendMessage(conn, writeMu, WSMessage{
 			Type:    "pong",
 			Message: "alive",
 		})
+	case "interrupt":
+		// 【打断机制】支持手动大声或者按钮打断
+		log.Printf("【打断机制】收到客户端主动打断指令，停止房间 [%s] 的当前播放", session.RoomID)
+		ctrl.interruptPlayback(conn, writeMu, session.RoomID)
 	}
 }
 
@@ -684,40 +888,114 @@ func (ctrl *VoiceWSController) sendMessage(conn *websocket.Conn, writeMu *sync.M
 // 服务端 TTS 语音合成与音频回传（用于硬件设备扬声器播放）
 // ---------------------------------------------------------------------------
 
-// pushAudioChunks 将 PCM 音频数据分块通过 WebSocket 二进制帧推送给设备
-// 每帧 4096 字节 ≈ 128ms 音频 @ 16kHz 16-bit mono
+// pushAudioChunks 将 PCM 音频数据分块通过 WebSocket 二进制帧推送给设备，支持 Opus 压缩与打断取消
 func (ctrl *VoiceWSController) pushAudioChunks(
 	conn *websocket.Conn,
 	writeMu *sync.Mutex,
 	audioData []byte,
+	codec string,
+	opusEncoder *opus.Encoder,
+	ctx context.Context,
 ) {
-	chunkSize := 4096
-	for i := 0; i < len(audioData); i += chunkSize {
-		end := i + chunkSize
-		if end > len(audioData) {
-			end = len(audioData)
+	if codec == "opus" {
+		if opusEncoder == nil {
+			return
+		}
+		// 16kHz 16-bit mono -> 20ms frame = 320 samples = 640 bytes
+		const frameSamples = 320
+		const frameBytes = frameSamples * 2
+
+		// 补齐尾部数据，确保是 640 字节（20ms）的整数倍
+		leftover := len(audioData) % frameBytes
+		if leftover > 0 {
+			padding := make([]byte, frameBytes-leftover)
+			audioData = append(audioData, padding...)
 		}
 
-		writeMu.Lock()
-		writeErr := conn.WriteMessage(websocket.BinaryMessage, audioData[i:end])
-		writeMu.Unlock()
+		// 将字节数组转换为 int16 采样
+		pcmSamples := make([]int16, len(audioData)/2)
+		for i := 0; i < len(pcmSamples); i++ {
+			pcmSamples[i] = int16(binary.LittleEndian.Uint16(audioData[i*2 : i*2+2]))
+		}
 
-		if writeErr != nil {
-			log.Printf("【TTS 回传】音频推送中断（设备可能已断开连接）: %v", writeErr)
-			return
+		opusBuf := make([]byte, 1024)
+		for i := 0; i < len(pcmSamples); i += frameSamples {
+			// 【打断检测】在每个 Opus 分片发送前，快速检查是否已打断
+			if ctx.Err() != nil {
+				return
+			}
+
+			end := i + frameSamples
+			n, err := opusEncoder.Encode(pcmSamples[i:end], opusBuf)
+			if err != nil {
+				log.Printf("【TTS Opus 编码】压缩音频失败: %v", err)
+				return
+			}
+
+			writeMu.Lock()
+			writeErr := conn.WriteMessage(websocket.BinaryMessage, opusBuf[:n])
+			writeMu.Unlock()
+
+			if writeErr != nil {
+				log.Printf("【TTS Opus 回传】数据包推送失败: %v", writeErr)
+				return
+			}
+
+			// 20ms 的音频数据包，微弱延时以模拟真实播放速率，防止缓冲区溢出
+			time.Sleep(18 * time.Millisecond) // 略微小于 20ms，保持平滑且不会累积延时
+		}
+	} else {
+		// 原有的 PCM 分块推送逻辑
+		chunkSize := 4096
+		for i := 0; i < len(audioData); i += chunkSize {
+			// 【打断检测】
+			if ctx.Err() != nil {
+				return
+			}
+			end := i + chunkSize
+			if end > len(audioData) {
+				end = len(audioData)
+			}
+
+			writeMu.Lock()
+			writeErr := conn.WriteMessage(websocket.BinaryMessage, audioData[i:end])
+			writeMu.Unlock()
+
+			if writeErr != nil {
+				log.Printf("【TTS 回传】音频推送中断: %v", writeErr)
+				return
+			}
 		}
 	}
 }
 
 // streamAudioToClient 将文本通过 Edge TTS 合成为 PCM 音频，并以 WebSocket 二进制帧流式推送给硬件设备
-// 用于简短的唤醒/休眠提示音（非流式大模型场景）
+// 用于简短的唤醒/休眠提示音，支持打断和 Opus 格式
 func (ctrl *VoiceWSController) streamAudioToClient(
 	conn *websocket.Conn,
 	writeMu *sync.Mutex,
 	text string,
+	codec string,
+	opusEncoder *opus.Encoder,
+	roomID string,
+	parentCtx ...context.Context,
 ) {
 	if text == "" {
 		return
+	}
+
+	// 准备支持打断取消的 Context
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if len(parentCtx) > 0 && parentCtx[0] != nil {
+		ctx = parentCtx[0]
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+		ctrl.activeCancels.Store(roomID, cancel)
+		defer func() {
+			cancel()
+			ctrl.activeCancels.Delete(roomID)
+		}()
 	}
 
 	ttsSvc := services.NewTTSService()
@@ -730,10 +1008,35 @@ func (ctrl *VoiceWSController) streamAudioToClient(
 		return
 	}
 
-	ctrl.sendMessage(conn, writeMu, WSMessage{Type: "audio_start", Message: "pcm_16k_16bit_mono"})
-	ctrl.pushAudioChunks(conn, writeMu, audioData)
+	audioMsg := "pcm_16k_16bit_mono"
+	if codec == "opus" {
+		audioMsg = "opus_16k_mono"
+	}
+
+	ctrl.sendMessage(conn, writeMu, WSMessage{Type: "audio_start", Message: audioMsg})
+	ctrl.pushAudioChunks(conn, writeMu, audioData, codec, opusEncoder, ctx)
 	ctrl.sendMessage(conn, writeMu, WSMessage{Type: "audio_end", Message: "playback_complete"})
 
 	log.Printf("【TTS 回传】音频已推送至设备, 共 %d 字节 (%.1f 秒)",
 		len(audioData), float64(len(audioData))/(16000.0*2.0))
+}
+
+// calculateVolumeSamples 计算 int16 采样切片的平均绝对振幅（音量）
+func calculateVolumeSamples(samples []int16) float64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, val := range samples {
+		absVal := val
+		if val < 0 {
+			if val == -32768 {
+				absVal = 32767
+			} else {
+				absVal = -val
+			}
+		}
+		sum += float64(absVal)
+	}
+	return sum / float64(len(samples))
 }

@@ -43,6 +43,13 @@
               />
             </el-form-item>
 
+            <el-form-item label="请求方法 (Method)">
+              <el-radio-group v-model="serverForm.method">
+                <el-radio-button label="POST">POST (默认)</el-radio-button>
+                <el-radio-button label="GET">GET</el-radio-button>
+              </el-radio-group>
+            </el-form-item>
+
             <el-form-item label="自定义 HTTP Headers (请求头列表, 可选)">
               <div class="pairs-editor">
                 <div v-for="(pair, idx) in headerPairs" :key="'header-' + idx" class="pair-row">
@@ -131,6 +138,14 @@
             <el-table-column prop="base_url" label="服务器地址 Base URL" min-width="240" show-overflow-tooltip>
               <template #default="scope">
                 <code class="code-url">{{ scope.row.base_url }}</code>
+              </template>
+            </el-table-column>
+
+            <el-table-column prop="method" label="请求方法" width="100" align="center">
+              <template #default="scope">
+                <el-tag :type="scope.row.method === 'GET' ? 'warning' : 'primary'" size="small">
+                  {{ scope.row.method || 'POST' }}
+                </el-tag>
               </template>
             </el-table-column>
 
@@ -238,6 +253,7 @@ const serverFormRef = ref(null);
 const serverForm = ref({
   name: '本地模拟 MCP 传感器',
   base_url: 'http://localhost:8080/api/mcp', // 示例外部 MCP 服务地址
+  method: 'POST',
   headers: '{}',
   params: '{}',
 });
@@ -270,6 +286,7 @@ const testNewServer = async () => {
       try {
         const res = await request.post('/mcp/servers/test', {
           base_url: serverForm.value.base_url,
+          method: serverForm.value.method,
           headers: getSerializedJSON(headerPairs.value),
           params: getSerializedJSON(paramPairs.value),
         });
@@ -300,6 +317,7 @@ const testExistingServer = async (server) => {
     ElMessage.info(`正在实时探测外部服务 [${server.name}]...`);
     const res = await request.post('/mcp/servers/test', {
       base_url: server.base_url,
+      method: server.method || 'POST',
       headers: server.headers,
       params: server.params,
     });
@@ -326,6 +344,7 @@ const handleRegisterServer = async () => {
         const res = await request.post('/mcp/servers', {
           name: serverForm.value.name,
           base_url: serverForm.value.base_url,
+          method: serverForm.value.method,
           headers: getSerializedJSON(headerPairs.value),
           params: getSerializedJSON(paramPairs.value),
         });
@@ -336,6 +355,7 @@ const handleRegisterServer = async () => {
         serverForm.value = {
           name: '',
           base_url: '',
+          method: 'POST',
           headers: '{}',
           params: '{}',
         };

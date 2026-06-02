@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"RedQueenSystem/database"
@@ -25,8 +26,9 @@ func NewMCPServerController() *MCPServerController {
 // TestRequest 定义测试连接的请求体
 type TestRequest struct {
 	BaseURL string `json:"base_url" binding:"required"`
-	Headers string `json:"headers"` // JSON string
-	Params  string `json:"params"`  // JSON string
+	Method  string `json:"method"`   // GET or POST
+	Headers string `json:"headers"`  // JSON string
+	Params  string `json:"params"`   // JSON string
 }
 
 // TestServerHandshake 执行真实的 MCP JSON-RPC 2.0 握手测试
@@ -50,13 +52,26 @@ func (ctrl *MCPServerController) TestServerHandshake(c *gin.Context) {
 		return
 	}
 
-	httpReq, err := http.NewRequest("POST", req.BaseURL, bytes.NewBuffer(jsonBytes))
+	var httpReq *http.Request
+	method := strings.ToUpper(req.Method)
+	if method == "" {
+		method = "POST"
+	}
+
+	if method == "GET" {
+		fullURL := req.BaseURL + "?jsonrpc=2.0&method=tools/list&id=1"
+		httpReq, err = http.NewRequest("GET", fullURL, nil)
+	} else {
+		httpReq, err = http.NewRequest("POST", req.BaseURL, bytes.NewBuffer(jsonBytes))
+		if err == nil {
+			httpReq.Header.Set("Content-Type", "application/json")
+		}
+	}
+
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "无效的 Base URL 地址: " + err.Error()})
 		return
 	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
 
 	// 2. 解析并附加自定义 Headers
 	if req.Headers != "" {

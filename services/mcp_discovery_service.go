@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -173,22 +175,36 @@ func GetExternalMCPTools() ([]mcp.Tool, []map[string]interface{}, map[string]mod
 	client := &http.Client{Timeout: 3 * time.Second}
 
 	for _, srv := range servers {
-		// 1. 发送 JSON-RPC tools/list 请求
-		rpcReq := map[string]interface{}{
-			"jsonrpc": "2.0",
-			"method":  "tools/list",
-			"id":      1,
-		}
-		jsonBytes, err := json.Marshal(rpcReq)
-		if err != nil {
-			continue
+		var req *http.Request
+		var err error
+
+		method := strings.ToUpper(srv.Method)
+		if method == "" {
+			method = "POST"
 		}
 
-		req, err := http.NewRequest("POST", srv.BaseURL, bytes.NewBuffer(jsonBytes))
+		if method == "GET" {
+			fullURL := srv.BaseURL + "?jsonrpc=2.0&method=tools/list&id=1"
+			req, err = http.NewRequest("GET", fullURL, nil)
+		} else {
+			rpcReq := map[string]interface{}{
+				"jsonrpc": "2.0",
+				"method":  "tools/list",
+				"id":      1,
+			}
+			jsonBytes, marshalErr := json.Marshal(rpcReq)
+			if marshalErr != nil {
+				continue
+			}
+			req, err = http.NewRequest("POST", srv.BaseURL, bytes.NewBuffer(jsonBytes))
+			if err == nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+		}
+
 		if err != nil {
 			continue
 		}
-		req.Header.Set("Content-Type", "application/json")
 
 		// 附加自定义 Headers
 		if srv.Headers != "" {
@@ -275,26 +291,46 @@ func CallExternalMCPTool(srv models.MCPServer, toolName string, arguments string
 	var parsedArgs map[string]interface{}
 	_ = json.Unmarshal([]byte(arguments), &parsedArgs)
 
-	rpcReq := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"method":  "tools/call",
-		"params": map[string]interface{}{
+	var req *http.Request
+	var err error
+
+	method := strings.ToUpper(srv.Method)
+	if method == "" {
+		method = "POST"
+	}
+
+	if method == "GET" {
+		paramsObj := map[string]interface{}{
 			"name":      toolName,
 			"arguments": parsedArgs,
-		},
-		"id": 1,
+		}
+		paramsJSON, _ := json.Marshal(paramsObj)
+		fullURL := fmt.Sprintf("%s?jsonrpc=2.0&method=tools/call&params=%s&id=1",
+			srv.BaseURL, url.QueryEscape(string(paramsJSON)))
+		req, err = http.NewRequest("GET", fullURL, nil)
+	} else {
+		rpcReq := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"method":  "tools/call",
+			"params": map[string]interface{}{
+				"name":      toolName,
+				"arguments": parsedArgs,
+			},
+			"id": 1,
+		}
+		jsonBytes, marshalErr := json.Marshal(rpcReq)
+		if marshalErr != nil {
+			return "", fmt.Errorf("构建请求失败: %v", marshalErr)
+		}
+		req, err = http.NewRequest("POST", srv.BaseURL, bytes.NewBuffer(jsonBytes))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
 	}
 
-	jsonBytes, err := json.Marshal(rpcReq)
-	if err != nil {
-		return "", fmt.Errorf("构建请求失败: %v", err)
-	}
-
-	req, err := http.NewRequest("POST", srv.BaseURL, bytes.NewBuffer(jsonBytes))
 	if err != nil {
 		return "", fmt.Errorf("构建请求对象失败: %v", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	// 附加 Custom Headers
 	if srv.Headers != "" {
