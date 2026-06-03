@@ -95,6 +95,8 @@ func SetupRouter(cfg config.Config) *gin.Engine {
 		{
 			sysConfig.GET("/model", configCtrl.GetModelConfig)    // 获取当前大模型配置
 			sysConfig.POST("/model", configCtrl.UpdateModelConfig) // 更新大模型配置参数
+			sysConfig.POST("/voiceprint/register", configCtrl.RegisterVoiceprint) // 注册主人声纹
+			sysConfig.DELETE("/voiceprint/:index", configCtrl.DeleteVoiceprint) // 删除指定声纹
 		}
 	}
 

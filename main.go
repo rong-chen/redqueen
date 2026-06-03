@@ -45,6 +45,15 @@ func main() {
 		}()
 	}
 
+	// 3.5 初始化离线声纹识别引擎
+	voiceprintModelPath := "models/voiceprint/wespeaker_zh_cnceleb_resnet34.onnx"
+	if err := services.InitVoiceprint(voiceprintModelPath); err != nil {
+		log.Printf("[警告] 离线声纹识别引擎初始化失败: %v", err)
+		log.Println("[警告] 声纹主人锁功能将不可用，但其他系统功能正常运行")
+	} else {
+		log.Println("[就绪] 离线声纹识别引擎已就绪")
+	}
+
 	// 4. 构建并配置 Gin 路由规则
 	router := routers.SetupRouter(cfg)
 

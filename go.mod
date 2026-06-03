@@ -8,6 +8,7 @@ require (
 	github.com/k2-fsa/sherpa-onnx-go v1.13.2
 	github.com/mark3labs/mcp-go v0.54.1
 	golang.org/x/crypto v0.52.0
+	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.1
 )
@@ -56,5 +57,4 @@ require (
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
-	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302 // indirect
 )

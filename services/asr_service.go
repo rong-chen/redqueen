@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
@@ -27,6 +28,8 @@ type ASRService struct {
 type ASRStream struct {
 	stream     *sherpa.OnlineStream
 	recognizer *sherpa.OnlineRecognizer
+	audioBuf   []int16
+	audioMu    sync.Mutex
 }
 
 // InitASR 初始化全局 ASR 引擎，应在 main 函数启动时调用一次
@@ -34,6 +37,13 @@ type ASRStream struct {
 func InitASR(modelDir string) error {
 	var initErr error
 	asrEngineOnce.Do(func() {
+		// 检测是否存在热词定义文件
+		hotwordsPath := modelDir + "/hotwords.txt"
+		var finalHotwordsFile string
+		if _, err := os.Stat(hotwordsPath); err == nil {
+			finalHotwordsFile = hotwordsPath
+		}
+
 		config := &sherpa.OnlineRecognizerConfig{
 			ModelConfig: sherpa.OnlineModelConfig{
 				Transducer: sherpa.OnlineTransducerModelConfig{
@@ -50,11 +60,13 @@ func InitASR(modelDir string) error {
 				SampleRate: 16000,
 				FeatureDim: 80,
 			},
-			DecodingMethod:         "greedy_search",
+			DecodingMethod:         "modified_beam_search", // 启用热词偏置需使用 modified_beam_search 模式
 			EnableEndpoint:         1,
 			Rule1MinTrailingSilence: 2.4,  // 长停顿阈值（秒），超过则判定为句末
 			Rule2MinTrailingSilence: 1.2,  // 短停顿阈值（秒），句中自然停顿
 			Rule3MinUtteranceLength: 20.0, // 单句最大时长（秒）
+			HotwordsFile:           finalHotwordsFile,
+			HotwordsScore:          3.0, // 热词加权权重评分
 		}
 
 		recognizer := sherpa.NewOnlineRecognizer(config)
@@ -102,17 +114,50 @@ func (s *ASRService) Close() {
 
 // FeedAudio 将原始 16-bit little-endian PCM 字节数据喂入识别流
 func (s *ASRStream) FeedAudio(pcmData []byte) {
+	s.audioMu.Lock()
+	n := len(pcmData) / 2
+	maxSamples := 16000 * 15 // 最多缓存 15 秒音频
+	if len(s.audioBuf)+n > maxSamples {
+		excess := len(s.audioBuf) + n - maxSamples
+		s.audioBuf = s.audioBuf[excess:]
+	}
+	samplesInt16 := make([]int16, n)
+	for i := 0; i < n; i++ {
+		samplesInt16[i] = int16(binary.LittleEndian.Uint16(pcmData[i*2 : i*2+2]))
+	}
+	s.audioBuf = append(s.audioBuf, samplesInt16...)
+	s.audioMu.Unlock()
+
 	samples := PCMBytesToFloat32(pcmData)
 	s.stream.AcceptWaveform(16000, samples)
 }
 
 // FeedSamples 直接将 16-bit PCM 采样数组喂入识别流，避免中介 []byte 转换
 func (s *ASRStream) FeedSamples(samples []int16) {
+	s.audioMu.Lock()
+	n := len(samples)
+	maxSamples := 16000 * 15 // 最多缓存 15 秒音频
+	if len(s.audioBuf)+n > maxSamples {
+		excess := len(s.audioBuf) + n - maxSamples
+		s.audioBuf = s.audioBuf[excess:]
+	}
+	s.audioBuf = append(s.audioBuf, samples...)
+	s.audioMu.Unlock()
+
 	floatSamples := make([]float32, len(samples))
 	for i, v := range samples {
 		floatSamples[i] = float32(v) / 32768.0
 	}
 	s.stream.AcceptWaveform(16000, floatSamples)
+}
+
+// GetAndClearAudio 获取当前句子的音频缓存并清空
+func (s *ASRStream) GetAndClearAudio() []int16 {
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
+	buf := s.audioBuf
+	s.audioBuf = nil
+	return buf
 }
 
 // Decode 处理识别流中已缓冲的全部音频帧
@@ -136,6 +181,9 @@ func (s *ASRStream) IsEndpoint() bool {
 // Reset 重置识别流状态，一句话识别完毕后调用以准备下一句
 func (s *ASRStream) Reset() {
 	s.recognizer.Reset(s.stream)
+	s.audioMu.Lock()
+	s.audioBuf = nil
+	s.audioMu.Unlock()
 }
 
 // Delete 释放识别流资源，WebSocket 连接关闭时必须调用

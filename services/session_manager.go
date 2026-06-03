@@ -57,6 +57,7 @@ type Session struct {
 	LastActiveTime time.Time     // 上次活跃时间戳
 	RoomID         string        // 房间 ID
 	MaxVolume      float64       // 最近音频的平滑最大音量
+	IsSpeaking     bool          // 前端是否正在播放语音
 }
 
 // 结束对话的关键词列表
@@ -167,8 +168,8 @@ func (s *Session) GetState() SessionState {
 
 // handleSleepingState 休眠态下的文字处理
 func (s *Session) handleSleepingState(text string) SessionAction {
-	// 检查是否包含唤醒词
-	wakeIdx := strings.Index(text, s.WakeWord)
+	// 检查是否匹配到唤醒词或其相似音别名
+	wakeIdx, matchedLen := s.findWakeWord(text)
 	if wakeIdx < 0 {
 		return SessionAction{Type: ActionIgnore}
 	}
@@ -178,9 +179,9 @@ func (s *Session) handleSleepingState(text string) SessionAction {
 	s.LastActiveTime = time.Now()
 
 	// 提取唤醒词之后的内容作为指令
-	afterWake := strings.TrimSpace(text[wakeIdx+len(s.WakeWord):])
+	afterWake := strings.TrimSpace(text[wakeIdx+matchedLen:])
 
-	// 清理常见的唤醒前缀词（如 "嗨"、"hi"、"你好" 等）
+	// 清理常见的唤醒前缀词与标点
 	afterWake = cleanCommand(afterWake)
 
 	if afterWake != "" {
@@ -204,9 +205,9 @@ func (s *Session) handleActiveState(text string) SessionAction {
 		return SessionAction{Type: ActionSleep}
 	}
 
-	// 如果又提到了唤醒词，提取唤醒词后面的内容
-	if wakeIdx := strings.Index(text, s.WakeWord); wakeIdx >= 0 {
-		afterWake := strings.TrimSpace(text[wakeIdx+len(s.WakeWord):])
+	// 如果又匹配到了唤醒词，提取唤醒词后面的内容
+	if wakeIdx, matchedLen := s.findWakeWord(text); wakeIdx >= 0 {
+		afterWake := strings.TrimSpace(text[wakeIdx+matchedLen:])
 		afterWake = cleanCommand(afterWake)
 		if afterWake != "" {
 			return SessionAction{
@@ -229,6 +230,28 @@ func (s *Session) handleActiveState(text string) SessionAction {
 // 辅助函数
 // ---------------------------------------------------------------------------
 
+// findWakeWord 查找唤醒词或其同音/近音词别名，返回其在文本中的起始位置和匹配词字节长度
+func (s *Session) findWakeWord(text string) (int, int) {
+	// 1. 优先完全匹配主唤醒词
+	idx := strings.Index(text, s.WakeWord)
+	if idx >= 0 {
+		return idx, len(s.WakeWord)
+	}
+
+	// 2. 如果主唤醒词是 "皇后"，则允许常见的 ASR 识别同音/近音误判词作为唤醒词别名
+	if s.WakeWord == "皇后" {
+		aliases := []string{"王后", "黄后", "皇厚", "王厚", "黄厚", "红皇后", "红王后", "红黄后"}
+		for _, alias := range aliases {
+			aIdx := strings.Index(text, alias)
+			if aIdx >= 0 {
+				return aIdx, len(alias)
+			}
+		}
+	}
+
+	return -1, 0
+}
+
 // isSleepCommand 判断文字是否为结束对话的指令
 func isSleepCommand(text string) bool {
 	text = strings.TrimSpace(text)
@@ -240,9 +263,15 @@ func isSleepCommand(text string) bool {
 	return false
 }
 
-// cleanCommand 清理指令文本中的无意义前缀词
+// cleanCommand 清理指令文本中的无意义前缀词和前后标点
 func cleanCommand(text string) string {
-	// 移除常见的口语化连接词前缀
+	// 1. 移除首尾的常用标点符号与空格
+	text = strings.TrimFunc(text, func(r rune) bool {
+		return r == ',' || r == '.' || r == '?' || r == '!' || r == ':' || r == ';' ||
+			r == '，' || r == '。' || r == '？' || r == '！' || r == '：' || r == '；' || r == '、' || r == ' '
+	})
+
+	// 2. 移除常见的口语化连接词前缀
 	prefixes := []string{"请", "帮我", "帮忙", "麻烦", "可以"}
 	result := text
 	for _, prefix := range prefixes {
@@ -255,5 +284,33 @@ func cleanCommand(text string) string {
 			break // 只去一层前缀
 		}
 	}
+
+	// 3. 再次清理前导和尾随标点符号以防万一
+	result = strings.TrimFunc(result, func(r rune) bool {
+		return r == ',' || r == '.' || r == '?' || r == '!' || r == ':' || r == ';' ||
+			r == '，' || r == '。' || r == '？' || r == '！' || r == '：' || r == '；' || r == '、' || r == ' '
+	})
+
 	return result
+}
+
+// IsSpeakingGetter 获取前端是否正在播放语音（线程安全）
+func (s *Session) IsSpeakingGetter() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.IsSpeaking
+}
+
+// SetSpeaking 设置前端朗读/播放状态（线程安全）
+func (s *Session) SetSpeaking(val bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.IsSpeaking = val
+}
+
+// RefreshActiveTime 刷新活跃时间（线程安全）
+func (s *Session) RefreshActiveTime() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LastActiveTime = time.Now()
 }

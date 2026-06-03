@@ -283,14 +283,18 @@ func (s *NLPService) ParseIntent(transcript string) (ParseResult, error) {
 		}
 
 		// 若没有命中任何工具，说明大模型已经输出了最终的自然回复文本！
-		finalResult.ReplyText = lastReplyText
+		reThink := regexp.MustCompile(`(?s)<think>.*?</think>`)
+		finalResult.ReplyText = reThink.ReplaceAllString(lastReplyText, "")
+		finalResult.ReplyText = strings.TrimSpace(finalResult.ReplyText)
 		break
 	}
 
 	// 兜底：如果递归异常失败，直接展现最后一次接收的内容
 	if finalResult.ReplyText == "" {
 		if lastReplyText != "" {
-			finalResult.ReplyText = lastReplyText
+			reThink := regexp.MustCompile(`(?s)<think>.*?</think>`)
+			finalResult.ReplyText = reThink.ReplaceAllString(lastReplyText, "")
+			finalResult.ReplyText = strings.TrimSpace(finalResult.ReplyText)
 		} else {
 			finalResult.ReplyText = "你好，我是红皇后，目前没有匹配到可用的控制工具或意图。"
 		}
@@ -368,6 +372,10 @@ func (s *NLPService) ParseIntentStream(transcript string) (<-chan StreamChunk, e
 		isBuffering := false
 		isDSMLToolCall := false
 
+		// 用于过滤 <think> ... </think> 思考链的变量
+		inThinkBlock := false
+		var thinkBuffer strings.Builder
+
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -442,35 +450,76 @@ func (s *NLPService) ParseIntentStream(transcript string) (<-chan StreamChunk, e
 
 			delta := chunk.Choices[0].Delta
 
-			// 处理文本内容 delta (带有 DSML 流拦截看门狗)
+			// 处理文本内容 delta (带有 DSML 流拦截看门狗 & <think> 过滤)
 			if delta.Content != "" {
-				if !isBuffering && !isDSMLToolCall {
-					// 发现以 "<" 或 "<｜" 开头，开启前缀预判缓冲模式
-					trimmed := strings.TrimSpace(delta.Content)
-					if strings.HasPrefix(trimmed, "<") {
-						isBuffering = true
+				// 1. 如果在 think 块中，累积并检查结束标志
+				if inThinkBlock {
+					thinkBuffer.WriteString(delta.Content)
+					acc := thinkBuffer.String()
+					if idx := strings.Index(acc, "</think>"); idx != -1 {
+						inThinkBlock = false
+						delta.Content = acc[idx+8:] // 跳过 </think>
+						thinkBuffer.Reset()
+					} else {
+						// 还在 think 中，忽略该 token
+						continue
 					}
 				}
 
-				if isBuffering {
-					contentAccumulator.WriteString(delta.Content)
-					accStr := contentAccumulator.String()
-
-					// 判定是否符合 DSML 前缀
-					if strings.Contains(accStr, "<｜｜DSML｜｜tool_calls>") {
-						isDSMLToolCall = true
-						isBuffering = false
-					} else if len(accStr) >= 40 {
-						// 累积足够长还不包含特征词，判定为普通文本，冲刷并关闭缓冲
-						ch <- StreamChunk{Token: accStr}
-						contentAccumulator.Reset()
-						isBuffering = false
+				// 2. 检测是否进入 think 块
+				if !inThinkBlock && strings.Contains(delta.Content, "<think>") {
+					idx := strings.Index(delta.Content, "<think>")
+					before := delta.Content[:idx]
+					after := delta.Content[idx+7:] // 跳过 <think>
+					
+					inThinkBlock = true
+					thinkBuffer.Reset()
+					thinkBuffer.WriteString(after)
+					
+					// 检查当前 token 是否就已经包含了 </think> 结束符
+					acc := thinkBuffer.String()
+					if idxEnd := strings.Index(acc, "</think>"); idxEnd != -1 {
+						inThinkBlock = false
+						delta.Content = before + acc[idxEnd+8:]
+						thinkBuffer.Reset()
+					} else {
+						if before != "" {
+							delta.Content = before
+						} else {
+							continue
+						}
 					}
-				} else if isDSMLToolCall {
-					// 静默累积全部工具调用文本，不发给前端，也不进行 TTS 发声
-					contentAccumulator.WriteString(delta.Content)
-				} else {
-					ch <- StreamChunk{Token: delta.Content}
+				}
+
+				if delta.Content != "" {
+					if !isBuffering && !isDSMLToolCall {
+						// 发现以 "<" 或 "<｜" 开头，开启前缀预判缓冲模式
+						trimmed := strings.TrimSpace(delta.Content)
+						if strings.HasPrefix(trimmed, "<") {
+							isBuffering = true
+						}
+					}
+
+					if isBuffering {
+						contentAccumulator.WriteString(delta.Content)
+						accStr := contentAccumulator.String()
+
+						// 判定是否符合 DSML 前缀
+						if strings.Contains(accStr, "<｜｜DSML｜｜tool_calls>") {
+							isDSMLToolCall = true
+							isBuffering = false
+						} else if len(accStr) >= 40 {
+							// 累积足够长还不包含特征词，判定为普通文本，冲刷并关闭缓冲
+							ch <- StreamChunk{Token: accStr}
+							contentAccumulator.Reset()
+							isBuffering = false
+						}
+					} else if isDSMLToolCall {
+						// 静默累积全部工具调用文本，不发给前端，也不进行 TTS 发声
+						contentAccumulator.WriteString(delta.Content)
+					} else {
+						ch <- StreamChunk{Token: delta.Content}
+					}
 				}
 			}
 
@@ -599,6 +648,10 @@ func (s *NLPService) GenerateStreamingReply(messages []map[string]interface{}) (
 		defer close(ch)
 		defer resp.Body.Close()
 
+		// 用于过滤 <think> ... </think> 思考链的变量
+		inThinkBlock := false
+		var thinkBuffer strings.Builder
+
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -638,9 +691,50 @@ func (s *NLPService) GenerateStreamingReply(messages []map[string]interface{}) (
 
 			delta := chunk.Choices[0].Delta
 
-			// 处理文本内容 delta
+			// 处理文本内容 delta (含 <think> 过滤)
 			if delta.Content != "" {
-				ch <- StreamChunk{Token: delta.Content}
+				// 1. 如果在 think 块中，累积并检查结束标志
+				if inThinkBlock {
+					thinkBuffer.WriteString(delta.Content)
+					acc := thinkBuffer.String()
+					if idx := strings.Index(acc, "</think>"); idx != -1 {
+						inThinkBlock = false
+						delta.Content = acc[idx+8:] // 跳过 </think>
+						thinkBuffer.Reset()
+					} else {
+						// 还在 think 中，忽略该 token
+						continue
+					}
+				}
+
+				// 2. 检测是否进入 think 块
+				if !inThinkBlock && strings.Contains(delta.Content, "<think>") {
+					idx := strings.Index(delta.Content, "<think>")
+					before := delta.Content[:idx]
+					after := delta.Content[idx+7:] // 跳过 <think>
+					
+					inThinkBlock = true
+					thinkBuffer.Reset()
+					thinkBuffer.WriteString(after)
+					
+					// 检查当前 token 是否就已经包含了 </think> 结束符
+					acc := thinkBuffer.String()
+					if idxEnd := strings.Index(acc, "</think>"); idxEnd != -1 {
+						inThinkBlock = false
+						delta.Content = before + acc[idxEnd+8:]
+						thinkBuffer.Reset()
+					} else {
+						if before != "" {
+							delta.Content = before
+						} else {
+							continue
+						}
+					}
+				}
+
+				if delta.Content != "" {
+					ch <- StreamChunk{Token: delta.Content}
+				}
 			}
 		}
 

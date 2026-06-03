@@ -109,20 +109,21 @@ func seedModelConfig(db *gorm.DB) error {
 		return err
 	}
 
-	defaultPrompt := "你是一个{{.SystemRole}}，性格{{.SystemPersonality}}，回复请用人类的语气，并且称我为主人。"
-	defaultPersonality := "冷酷的，简短的，不带语气词的，"
+	defaultPrompt := "你是一个{{.SystemRole}}，性格{{.SystemPersonality}}。【严格约束】对于涉及控制实体硬件、查询传感器或执行设备状态的操作，你必须严格基于已调用的外部工具（MCP）返回的真实数据和状态进行回复，严禁凭空编造数值或状态。如果工具执行失败，请诚实报告。对于普通的日常闲聊、故事、问候或常识性对话，你应当直接且符合你性格地进行回答，无需调用工具。"
+	defaultPersonality := "冷酷的，简短的，不带语气词的"
 
 	if count == 0 {
 		log.Println("检测到系统首次运行，正在自动初始化默认大模型配置...")
 		
 		cfg := models.ModelConfig{
-			ActiveMode:        "deepseek", // 默认直接使用大模型模式
-			ApiKey:            "",
-			ApiURL:            "https://api.deepseek.com", // 标准 OpenAI 格式基准 Endpoint
-			ModelName:         "deepseek-v4-pro", // 默认使用 deepseek-v4-pro
-			SystemPrompt:      defaultPrompt,
-			SystemRole:        "红皇后",
-			SystemPersonality: defaultPersonality,
+			ActiveMode:          "deepseek", // 默认直接使用大模型模式
+			ApiKey:              "",
+			ApiURL:              "https://api.deepseek.com", // 标准 OpenAI 格式基准 Endpoint
+			ModelName:           "deepseek-v4-pro", // 默认使用 deepseek-v4-pro
+			SystemPrompt:        defaultPrompt,
+			SystemRole:          "红皇后",
+			SystemPersonality:   defaultPersonality,
+			VoiceprintThreshold: 0.65, // 默认阈值
 		}
 
 		if err := db.Create(&cfg).Error; err != nil {
@@ -130,7 +131,7 @@ func seedModelConfig(db *gorm.DB) error {
 		}
 		log.Println("[成功] 默认大模型配置参数初始化成功!")
 	} else {
-		// 【自动升级与校准逻辑】自动升级为官方最新的 deepseek-v4-pro 与基准 URL https://api.deepseek.com
+		// 【自动升级与校准逻辑】仅在数据库字段为空时进行填充，不覆盖管理员在后台自定义修改的配置
 		var cfg models.ModelConfig
 		if db.First(&cfg).Error == nil {
 			needsUpdate := false
@@ -142,7 +143,7 @@ func seedModelConfig(db *gorm.DB) error {
 				cfg.ApiURL = "https://api.deepseek.com"
 				needsUpdate = true
 			}
-			if cfg.SystemPrompt != defaultPrompt {
+			if cfg.SystemPrompt == "" {
 				cfg.SystemPrompt = defaultPrompt
 				needsUpdate = true
 			}
@@ -150,8 +151,12 @@ func seedModelConfig(db *gorm.DB) error {
 				cfg.SystemRole = "红皇后"
 				needsUpdate = true
 			}
-			if cfg.SystemPersonality != defaultPersonality {
+			if cfg.SystemPersonality == "" {
 				cfg.SystemPersonality = defaultPersonality
+				needsUpdate = true
+			}
+			if cfg.VoiceprintThreshold == 0.0 {
+				cfg.VoiceprintThreshold = 0.65
 				needsUpdate = true
 			}
 			if needsUpdate {

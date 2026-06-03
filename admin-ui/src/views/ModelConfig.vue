@@ -78,6 +78,75 @@
           </div>
         </el-form-item>
 
+        <!-- 声纹主人锁配置 -->
+        <el-divider content-position="left">
+          <span style="font-weight: bold; color: #e6a23c; display: flex; align-items: center; gap: 4px;">
+            <el-icon><Lock /></el-icon> 说话人主人声纹锁设置（防止背景杂音与他人控制）
+          </span>
+        </el-divider>
+
+        <el-form-item label="主人声纹锁开关" prop="enable_voiceprint">
+          <el-switch
+            v-model="configForm.enable_voiceprint"
+            active-text="开启声纹主人锁"
+            inactive-text="关闭 (任何人或背景音均可控制)"
+          ></el-switch>
+          <div class="form-tip">
+            开启后，系统将使用 <code>wespeaker</code> 离线声纹算法校验音色。相似度低于阈值时，自动忽略指令且不进行LLM响应，防止电视杂音、旁人聊天导致误触发。
+          </div>
+        </el-form-item>
+
+        <el-form-item label="声纹匹配阈值" prop="voiceprint_threshold" v-if="configForm.enable_voiceprint">
+          <el-slider
+            v-model="configForm.voiceprint_threshold"
+            :min="0.50"
+            :max="0.90"
+            :step="0.01"
+            show-input
+            style="max-width: 450px;"
+          ></el-slider>
+          <div class="form-tip">
+            默认建议 0.65。如果主人发出的指令经常被拒绝，可以适当降低阈值（如0.60）；如果仍有电视背景声音能够误触发，请调高阈值（如0.70）。
+          </div>
+        </el-form-item>
+
+        <el-form-item label="主人声纹建档" prop="master_voiceprint">
+          <div style="margin-bottom: 12px;">
+            <el-tag :type="voiceprintCount > 0 ? 'success' : 'danger'" effect="dark" size="large">
+              {{ voiceprintCount > 0 ? `已建立 ${voiceprintCount} 条声纹采样` : '尚未录入声纹' }}
+            </el-tag>
+          </div>
+
+          <div v-if="voiceprintCount > 0" style="margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 8px;">
+            <el-tag
+              v-for="i in voiceprintCount"
+              :key="i"
+              closable
+              type="info"
+              effect="plain"
+              size="large"
+              @close="deleteVoiceprint(i - 1)"
+            >
+              声纹采样 #{{ i }}
+            </el-tag>
+          </div>
+
+          <el-button
+            :type="isRegistering ? 'danger' : 'warning'"
+            :loading="isRegistering"
+            :disabled="voiceprintCount >= 10"
+            @click="startRecording"
+            style="width: 100%; max-width: 450px;"
+          >
+            {{ isRegistering ? `请对着麦克风说话 (${registerTimeLeft} 秒)...` : (voiceprintCount >= 10 ? '已达上限 (最多 10 条)' : '添加一条新的声纹采样') }}
+          </el-button>
+
+          <div class="form-tip">
+            点此按钮后，请使用您平常说话的自然语气说一段话（推荐说 3 到 5 秒）。<br>
+            建议采集 <strong>3 ~ 5 条</strong> 不同状态的声纹（如正常说话、轻声说话、刚起床时的声音），多条采样可以显著提高识别准确率。
+          </div>
+        </el-form-item>
+
         <el-form-item>
           <el-button type="primary" :loading="submitLoading" @click="handleSave">
             保存配置并实时生效
@@ -105,8 +174,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ref, computed, onMounted } from 'vue';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import request from '../utils/request';
 
 const loading = ref(false);
@@ -120,6 +189,9 @@ const configForm = ref({
   system_role: '红皇后',
   system_personality: '符合皇后的语气',
   system_prompt: '',
+  enable_voiceprint: false,
+  voiceprint_threshold: 0.65,
+  master_voiceprint: '',
 });
 
 const rules = {
@@ -130,6 +202,153 @@ const rules = {
   system_personality: [{ required: true, message: '大模型扮演的个性和性格特点不能为空', trigger: 'blur' }],
   system_prompt: [{ required: true, message: '系统 Prompt 模板不能为空', trigger: 'blur' }],
 };
+
+// 声纹采样数量计算
+const voiceprintCount = computed(() => {
+  const vp = configForm.value.master_voiceprint;
+  if (!vp) return 0;
+  try {
+    const parsed = JSON.parse(vp);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      // 新格式: [][]float32 —— 数组的数组
+      if (Array.isArray(parsed[0])) return parsed.length;
+      // 旧格式: []float32 —— 单条声纹
+      return 1;
+    }
+  } catch (e) { /* ignore */ }
+  return 0;
+});
+
+// 删除指定索引的声纹采样
+async function deleteVoiceprint(index) {
+  try {
+    await ElMessageBox.confirm(
+      `确定要删除声纹采样 #${index + 1} 吗？`,
+      '删除确认',
+      { confirmButtonText: '确定删除', cancelButtonText: '取消', type: 'warning' }
+    );
+  } catch {
+    return; // 用户取消
+  }
+  try {
+    await request.delete(`/config/voiceprint/${index}`);
+    ElMessage.success(`已删除声纹采样 #${index + 1}`);
+    fetchConfig();
+  } catch (error) {
+    ElMessage.error(error.response?.data?.message || '删除声纹失败');
+  }
+}
+
+// 主人声纹录音与注册交互逻辑
+const isRegistering = ref(false);
+const registerTimeLeft = ref(5);
+const micStream = ref(null);
+let recAudioContext = null;
+let recScriptProcessor = null;
+let recSource = null;
+let pcmChunks = [];
+
+async function startRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    micStream.value = stream;
+    pcmChunks = [];
+    isRegistering.value = true;
+    registerTimeLeft.value = 5;
+
+    recAudioContext = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 16000,
+    });
+    recSource = recAudioContext.createMediaStreamSource(stream);
+    recScriptProcessor = recAudioContext.createScriptProcessor(4096, 1, 1);
+
+    recScriptProcessor.onaudioprocess = (event) => {
+      const inputData = event.inputBuffer.getChannelData(0);
+      const pcmData = new Int16Array(inputData.length);
+      for (let i = 0; i < inputData.length; i++) {
+        const s = Math.max(-1, Math.min(1, inputData[i]));
+        pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      pcmChunks.push(pcmData);
+    };
+
+    recSource.connect(recScriptProcessor);
+    recScriptProcessor.connect(recAudioContext.destination);
+
+    const interval = setInterval(() => {
+      registerTimeLeft.value--;
+      if (registerTimeLeft.value <= 0) {
+        clearInterval(interval);
+        stopRecordingAndRegister();
+      }
+    }, 1000);
+
+  } catch (err) {
+    console.error('麦克风开启失败:', err);
+    ElMessage.error('无法启动录音设备，请确保麦克风已授权');
+    isRegistering.value = false;
+  }
+}
+
+async function stopRecordingAndRegister() {
+  isRegistering.value = false;
+
+  if (recScriptProcessor) {
+    recScriptProcessor.disconnect();
+    recScriptProcessor = null;
+  }
+  if (recSource) {
+    recSource.disconnect();
+    recSource = null;
+  }
+  if (recAudioContext) {
+    recAudioContext.close();
+    recAudioContext = null;
+  }
+  if (micStream.value) {
+    micStream.value.getTracks().forEach(track => track.stop());
+    micStream.value = null;
+  }
+
+  let totalLength = 0;
+  for (const chunk of pcmChunks) {
+    totalLength += chunk.length;
+  }
+
+  if (totalLength === 0) {
+    ElMessage.warning('录音失败，没有捕获到音频数据');
+    return;
+  }
+
+  const mergedPcm = new Int16Array(totalLength);
+  let offset = 0;
+  for (const chunk of pcmChunks) {
+    mergedPcm.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  const bytes = new Uint8Array(mergedPcm.buffer);
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  const base64Data = btoa(binary);
+
+  loading.value = true;
+  try {
+    const res = await request.post('/config/voiceprint/register', {
+      audio_data: base64Data
+    });
+    ElMessage.success(res.data?.message || '声纹采样录入成功！');
+    fetchConfig();
+  } catch (error) {
+    console.error(error);
+    ElMessage.error(error.response?.data?.message || '声纹特征录入失败，请确保录制时间足够长且说话清晰');
+  } finally {
+    loading.value = false;
+  }
+}
 
 // 从后端获取当前配置详情
 const fetchConfig = async () => {

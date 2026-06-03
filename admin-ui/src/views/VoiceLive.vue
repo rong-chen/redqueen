@@ -219,7 +219,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick, computed } from 'vue';
+import { ref, onMounted, onUnmounted, nextTick, computed, watch } from 'vue';
 import { Microphone, VideoPause, ChatLineRound, Setting, UploadFilled } from '@element-plus/icons-vue';
 import { ElMessage } from 'element-plus';
 import * as THREE from 'three';
@@ -239,6 +239,18 @@ const selectedVoiceName = ref('');
 const cpuLoad = ref(24);            // 模拟高科技 HUD CPU 负载
 const isModelLoaded = ref(false);   // 3D 骨骼模型是否加载完毕
 const isSpeaking = ref(false);      // 红皇后本体当前是否正在播放语音答复
+let currentStreamMessage = null;    // 当前正在接收的流式回复消息对象引用
+
+// 监听朗读/播放状态，同步通知后端以避免 15s 自动休眠
+watch(isSpeaking, (val) => {
+  console.log('【ASR 升级】watch(isSpeaking) 触发，新值:', val);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'speaking_status',
+      text: val ? 'true' : 'false'
+    }));
+  }
+});
 
 // ---------------------------------------------------------------------------
 // 🎨 自定义 3D 模型 IndexedDB 永久化本地保存工具组
@@ -1056,22 +1068,60 @@ function handleServerMessage(msg) {
 
     case 'wake':
       isActive.value = true;
+      currentStreamMessage = null; // 清除流式缓存
       addMessage('wake', msg);
-      // 禁用本地低保真机械合成音，完全由服务端高保真神经网络音频流接管！
-      // speakText(msg.message);
       break;
 
     case 'sleep':
       isActive.value = false;
+      currentStreamMessage = null; // 清除流式缓存
       addMessage('sleep', msg);
-      // 禁用本地低保真机械合成音
-      // speakText(msg.message);
+      break;
+
+    case 'voiceprint_blocked':
+      addMessage('error', { text: msg.text || '', message: `【安全声纹锁拦截】${msg.message}` });
+      ElMessage.warning(`【声纹安全拦截】${msg.message}`);
+      break;
+
+    case 'stream_token':
+      // 收到大模型流式回复分片，追加到当前通信气泡中，避免碎片化
+      if (!currentStreamMessage) {
+        const now = new Date();
+        const time = now.toLocaleTimeString('zh-CN', { hour12: false });
+        const newMsgObj = {
+          type: 'result',
+          text: '',
+          message: msg.message || '',
+          intent: 'conversation',
+          status: 'pending',
+          time,
+        };
+        messages.value.push(newMsgObj);
+        // 获取 Vue 包装后的响应式代理对象，以便后续修改能触发 UI 更新
+        currentStreamMessage = messages.value[messages.value.length - 1];
+      } else {
+        currentStreamMessage.message += (msg.message || '');
+      }
+
+      nextTick(() => {
+        const list = messageListRef.value;
+        if (list) {
+          list.scrollTop = list.scrollHeight;
+        }
+      });
       break;
 
     case 'result':
-      addMessage('result', msg);
-      // 禁用本地低保真机械合成音
-      // speakText(msg.message);
+      if (currentStreamMessage) {
+        currentStreamMessage.intent = msg.intent || 'conversation';
+        currentStreamMessage.status = msg.status || 'success';
+        if (msg.message) {
+          currentStreamMessage.message = msg.message; // 确保使用后端的最终完整文本覆盖
+        }
+        currentStreamMessage = null; // 结束流式气泡编辑状态
+      } else {
+        addMessage('result', msg);
+      }
       break;
 
     case 'audio_start':
@@ -1091,6 +1141,7 @@ function handleServerMessage(msg) {
       }
       // 立即打断并清除当前正在播放的所有音频流，实现秒级快速打断响应！
       stopAllAudioPlayback();
+      currentStreamMessage = null; // 打断时清空流式气泡缓存
       addMessage('system', { message: '语音流被打断，接收全新指令' });
       break;
 
