@@ -116,10 +116,11 @@ func seedModelConfig(db *gorm.DB) error {
 		log.Println("检测到系统首次运行，正在自动初始化默认大模型配置...")
 		
 		cfg := models.ModelConfig{
-			ActiveMode:          "deepseek", // 默认直接使用大模型模式
+			ActiveMode:          "qwen-omni", // 默认使用 qwen-omni 实时模式
 			ApiKey:              "",
-			ApiURL:              "https://api.deepseek.com", // 标准 OpenAI 格式基准 Endpoint
-			ModelName:           "deepseek-v4-pro", // 默认使用 deepseek-v4-pro
+			ApiURL:              "wss://dashscope.aliyuncs.com/api-ws/v1/realtime", // 标准 Qwen-Omni 实时 WebSocket API
+			ModelName:           "qwen3.5-omni-plus-realtime", // 默认使用 Qwen-Omni plus 实时模型
+			Voice:               "Tina",                       // 默认音色 Tina
 			SystemPrompt:        defaultPrompt,
 			SystemRole:          "红皇后",
 			SystemPersonality:   defaultPersonality,
@@ -134,12 +135,20 @@ func seedModelConfig(db *gorm.DB) error {
 		var cfg models.ModelConfig
 		if db.First(&cfg).Error == nil {
 			needsUpdate := false
-			if cfg.ModelName == "" {
-				cfg.ModelName = "deepseek-v4-pro"
+			if cfg.ModelName == "" || cfg.ModelName == "deepseek-v4-pro" {
+				cfg.ModelName = "qwen3.5-omni-plus-realtime"
 				needsUpdate = true
 			}
-			if cfg.ApiURL == "" {
-				cfg.ApiURL = "https://api.deepseek.com"
+			if cfg.ApiURL == "" || cfg.ApiURL == "https://api.deepseek.com" {
+				cfg.ApiURL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+				needsUpdate = true
+			}
+			if cfg.ActiveMode == "" || cfg.ActiveMode == "deepseek" {
+				cfg.ActiveMode = "qwen-omni"
+				needsUpdate = true
+			}
+			if cfg.Voice == "" {
+				cfg.Voice = "Tina"
 				needsUpdate = true
 			}
 			if cfg.SystemPrompt == "" {

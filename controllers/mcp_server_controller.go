@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,8 @@ import (
 	"RedQueenSystem/services"
 
 	"github.com/gin-gonic/gin"
+	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 type MCPServerController struct{}
@@ -26,6 +29,7 @@ func NewMCPServerController() *MCPServerController {
 // TestRequest 定义测试连接的请求体
 type TestRequest struct {
 	BaseURL string `json:"base_url" binding:"required"`
+	Type    string `json:"type"`     // http or sse
 	Method  string `json:"method"`   // GET or POST
 	Headers string `json:"headers"`  // JSON string
 	Params  string `json:"params"`   // JSON string
@@ -36,6 +40,72 @@ func (ctrl *MCPServerController) TestServerHandshake(c *gin.Context) {
 	var req TestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "参数格式错误: " + err.Error()})
+		return
+	}
+
+	if req.Type == "sse" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var headersMap map[string]string
+		if req.Headers != "" {
+			if err := json.Unmarshal([]byte(req.Headers), &headersMap); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "Headers JSON 格式解析失败，请检查语法"})
+				return
+			}
+		}
+
+		mcpClient, err := mcpclient.NewSSEMCPClient(
+			req.BaseURL,
+			mcpclient.WithHeaders(headersMap),
+		)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"code":    500,
+				"status":  "offline",
+				"message": fmt.Sprintf("创建 SSE 客户端失败: %v", err),
+			})
+			return
+		}
+		defer mcpClient.Close()
+
+		if err := mcpClient.Start(ctx); err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"code":    500,
+				"status":  "offline",
+				"message": fmt.Sprintf("启动 SSE 客户端失败: %v", err),
+			})
+			return
+		}
+
+		initReq := mcp.InitializeRequest{}
+		initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+		initReq.Params.ClientInfo = mcp.Implementation{Name: "RedQueenSystem", Version: "1.0.0"}
+		if _, err := mcpClient.Initialize(ctx, initReq); err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"code":    500,
+				"status":  "offline",
+				"message": fmt.Sprintf("初始化 SSE 握手失败: %v", err),
+			})
+			return
+		}
+
+		if _, err := mcpClient.ListTools(ctx, mcp.ListToolsRequest{}); err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"code":    500,
+				"status":  "offline",
+				"message": fmt.Sprintf("获取工具列表失败: %v", err),
+			})
+			return
+		}
+
+		go services.DiscoverMCPServers()
+
+		c.JSON(http.StatusOK, gin.H{
+			"code":    200,
+			"status":  "online",
+			"message": "测试连接成功！已检测到外部 SSE MCP 服务处于在线状态，并成功握手同步工具集。",
+		})
 		return
 	}
 

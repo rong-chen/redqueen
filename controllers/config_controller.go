@@ -60,6 +60,7 @@ func (ctrl *ConfigController) UpdateModelConfig(c *gin.Context) {
 	existing.ApiKey = input.ApiKey
 	existing.ApiURL = input.ApiURL
 	existing.ModelName = input.ModelName
+	existing.Voice = input.Voice
 	existing.SystemPrompt = input.SystemPrompt
 	existing.SystemRole = input.SystemRole
 	existing.SystemPersonality = input.SystemPersonality

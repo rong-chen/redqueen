@@ -35,15 +35,22 @@
               />
             </el-form-item>
 
+            <el-form-item label="连接协议类型" prop="type">
+              <el-radio-group v-model="serverForm.type">
+                <el-radio-button label="http">HTTP (JSON-RPC)</el-radio-button>
+                <el-radio-button label="sse">SSE (Server-Sent Events)</el-radio-button>
+              </el-radio-group>
+            </el-form-item>
+
             <el-form-item label="服务器 Base URL" prop="base_url">
               <el-input 
                 v-model="serverForm.base_url" 
-                placeholder="例如：http://localhost:8080/api/mcp/rpc"
+                :placeholder="serverForm.type === 'sse' ? '例如：http://localhost:8080/sse' : '例如：http://localhost:8080/api/mcp/rpc'"
                 prefix-icon="Link"
               />
             </el-form-item>
 
-            <el-form-item label="请求方法 (Method)">
+            <el-form-item v-if="serverForm.type !== 'sse'" label="请求方法 (Method)">
               <el-radio-group v-model="serverForm.method">
                 <el-radio-button label="POST">POST (默认)</el-radio-button>
                 <el-radio-button label="GET">GET</el-radio-button>
@@ -141,9 +148,18 @@
               </template>
             </el-table-column>
 
+            <el-table-column prop="type" label="协议类型" width="110" align="center">
+              <template #default="scope">
+                <el-tag :type="scope.row.type === 'sse' ? 'success' : 'info'" size="small">
+                  {{ scope.row.type === 'sse' ? 'SSE' : 'HTTP' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+
             <el-table-column prop="method" label="请求方法" width="100" align="center">
               <template #default="scope">
-                <el-tag :type="scope.row.method === 'GET' ? 'warning' : 'primary'" size="small">
+                <span v-if="scope.row.type === 'sse'" style="color: #909399; font-style: italic;">N/A</span>
+                <el-tag v-else :type="scope.row.method === 'GET' ? 'warning' : 'primary'" size="small">
                   {{ scope.row.method || 'POST' }}
                 </el-tag>
               </template>
@@ -251,8 +267,9 @@ const getSerializedJSON = (pairs) => {
 // 绑定表单与校验规则
 const serverFormRef = ref(null);
 const serverForm = ref({
-  name: '本地模拟 MCP 传感器',
-  base_url: 'http://localhost:8080/api/mcp', // 示例外部 MCP 服务地址
+  name: '',
+  base_url: '', // 示例外部 MCP 服务地址
+  type: 'http',
   method: 'POST',
   headers: '{}',
   params: '{}',
@@ -286,6 +303,7 @@ const testNewServer = async () => {
       try {
         const res = await request.post('/mcp/servers/test', {
           base_url: serverForm.value.base_url,
+          type: serverForm.value.type,
           method: serverForm.value.method,
           headers: getSerializedJSON(headerPairs.value),
           params: getSerializedJSON(paramPairs.value),
@@ -317,6 +335,7 @@ const testExistingServer = async (server) => {
     ElMessage.info(`正在实时探测外部服务 [${server.name}]...`);
     const res = await request.post('/mcp/servers/test', {
       base_url: server.base_url,
+      type: server.type,
       method: server.method || 'POST',
       headers: server.headers,
       params: server.params,
@@ -344,6 +363,7 @@ const handleRegisterServer = async () => {
         const res = await request.post('/mcp/servers', {
           name: serverForm.value.name,
           base_url: serverForm.value.base_url,
+          type: serverForm.value.type,
           method: serverForm.value.method,
           headers: getSerializedJSON(headerPairs.value),
           params: getSerializedJSON(paramPairs.value),
@@ -355,6 +375,7 @@ const handleRegisterServer = async () => {
         serverForm.value = {
           name: '',
           base_url: '',
+          type: 'http',
           method: 'POST',
           headers: '{}',
           params: '{}',

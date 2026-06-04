@@ -13,13 +13,13 @@
       <el-form :model="configForm" :rules="rules" ref="configFormRef" label-width="160px" class="config-form">
         <!-- API KEY -->
         <el-form-item 
-          label="DeepSeek API Key" 
+          label="DashScope API Key" 
           prop="api_key"
         >
           <el-input
             v-model="configForm.api_key"
             type="password"
-            placeholder="请输入您的 DeepSeek API 秘钥 (Bearer Token)"
+            placeholder="请输入您的 阿里云 DashScope API 秘钥"
             show-password
           ></el-input>
           <div class="form-tip">
@@ -31,7 +31,7 @@
         <el-form-item label="API 端点 URL" prop="api_url">
           <el-input 
             v-model="configForm.api_url" 
-            placeholder="例如: https://api.deepseek.com/v1 (支持标准的 OpenAI 格式)"
+            placeholder="例如: wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
           ></el-input>
         </el-form-item>
 
@@ -39,8 +39,22 @@
         <el-form-item label="使用的模型名称" prop="model_name">
           <el-input 
             v-model="configForm.model_name" 
-            placeholder="例如: deepseek-chat"
+            placeholder="例如: qwen3.5-omni-plus-realtime"
           ></el-input>
+        </el-form-item>
+
+        <!-- 音色选择 -->
+        <el-form-item label="使用的音色名称" prop="voice">
+          <el-select v-model="configForm.voice" placeholder="选择音色" style="width: 100%;">
+            <el-option label="Tina (推荐 - 默认女声)" value="Tina" />
+            <el-option label="Cherry (温柔女声)" value="Cherry" />
+            <el-option label="Diana (熟女女声)" value="Diana" />
+            <el-option label="Grace (知性女声)" value="Grace" />
+            <el-option label="Jimmy (活力男声)" value="Jimmy" />
+          </el-select>
+          <div class="form-tip">
+            Qwen-Omni 实时语音模型支持的系统预设音色，支持 Tina, Cherry, Diana, Grace, Jimmy 等。
+          </div>
         </el-form-item>
 
         <!-- 角色指定 -->
@@ -97,8 +111,8 @@
         </span>
       </template>
       <div class="info-content">
-        <p>1. <strong>实时响应机制</strong>：后端的语音转意图服务（<code>services/nlp_service.go</code>）会在每次接收到交互请求时，自动从数据库载入最新更新的配置参数。</p>
-        <p>2. <strong>热重载（Hot-Reload）</strong>：这意味着您在管理后台中输入新的 API Key 或修改 System Prompts 后，无需重启您的 Golang 后端服务即可自动加载，直接进入测试！</p>
+        <p>1. <strong>实时响应机制</strong>：后端的 Qwen-Omni 语音服务会在每次接收到交互请求时，自动从数据库载入最新配置参数。</p>
+        <p>2. <strong>热重载（Hot-Reload）</strong>：这意味着您在管理后台中输入新的 API Key、切换音色或修改 System Prompts 后，无需重启您的 Golang 后端服务即可自动加载，直接进入测试！</p>
         <p>3. <strong>服务异常捕获</strong>：如果由于配置错误、欠费、超时或其它网络原因导致大模型查询请求失败，系统将停止执行，并直接在语音历史日志中呈现详尽的错误日志，方便实时追踪排查。</p>
       </div>
     </el-card>
@@ -116,8 +130,9 @@ const configFormRef = ref(null);
 
 const configForm = ref({
   api_key: '',
-  api_url: 'https://api.deepseek.com',
-  model_name: 'deepseek-v4-pro',
+  api_url: 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime',
+  model_name: 'qwen3.5-omni-plus-realtime',
+  voice: 'Tina',
   system_role: '红皇后',
   system_personality: '符合皇后的语气',
   system_prompt: '',
@@ -127,6 +142,7 @@ const rules = {
   api_key: [{ required: true, message: '请配置 API Key 秘钥以激活大模型', trigger: 'blur' }],
   api_url: [{ required: true, message: 'API 端点 URL 不能为空', trigger: 'blur' }],
   model_name: [{ required: true, message: '大模型名称不能为空', trigger: 'blur' }],
+  voice: [{ required: true, message: '请选择或输入音色名称', trigger: 'change' }],
   system_role: [{ required: true, message: '大模型扮演的角色名称不能为空', trigger: 'blur' }],
   system_personality: [{ required: true, message: '大模型扮演的个性和性格特点不能为空', trigger: 'blur' }],
   system_prompt: [{ required: true, message: '系统 Prompt 模板不能为空', trigger: 'blur' }],

@@ -16,6 +16,7 @@ import (
 	"RedQueenSystem/database"
 	"RedQueenSystem/models"
 
+	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -47,34 +48,62 @@ func DiscoverMCPServers() {
 				defer wg.Done()
 				status := "offline"
 
-				// 发送 tools/list 标准测试请求
-				rpcReq := map[string]interface{}{
-					"jsonrpc": "2.0",
-					"method":  "tools/list",
-					"id":      1,
-				}
-				jsonBytes, _ := json.Marshal(rpcReq)
-
-				req, err := http.NewRequest("POST", srv.BaseURL, bytes.NewBuffer(jsonBytes))
-				if err == nil {
-					req.Header.Set("Content-Type", "application/json")
-
-					// 附加 Headers
+				if srv.Type == "sse" {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					
+					headersMap := make(map[string]string)
 					if srv.Headers != "" {
-						var headersMap map[string]string
-						if err := json.Unmarshal([]byte(srv.Headers), &headersMap); err == nil {
-							for k, v := range headersMap {
-								req.Header.Set(k, v)
-							}
-						}
+						_ = json.Unmarshal([]byte(srv.Headers), &headersMap)
 					}
 
-					resp, err := client.Do(req)
+					mcpClient, err := mcpclient.NewSSEMCPClient(
+						srv.BaseURL,
+						mcpclient.WithHeaders(headersMap),
+					)
 					if err == nil {
-						defer resp.Body.Close()
-						if resp.StatusCode == http.StatusOK {
-							// 只要 HTTP 200 即证明端点联通
-							status = "online"
+						if err := mcpClient.Start(ctx); err == nil {
+							initReq := mcp.InitializeRequest{}
+							initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+							initReq.Params.ClientInfo = mcp.Implementation{Name: "RedQueenSystem", Version: "1.0.0"}
+							if _, err := mcpClient.Initialize(ctx, initReq); err == nil {
+								if _, err := mcpClient.ListTools(ctx, mcp.ListToolsRequest{}); err == nil {
+									status = "online"
+								}
+							}
+						}
+						mcpClient.Close()
+					}
+					cancel()
+				} else {
+					// 发送 tools/list 标准测试请求
+					rpcReq := map[string]interface{}{
+						"jsonrpc": "2.0",
+						"method":  "tools/list",
+						"id":      1,
+					}
+					jsonBytes, _ := json.Marshal(rpcReq)
+
+					req, err := http.NewRequest("POST", srv.BaseURL, bytes.NewBuffer(jsonBytes))
+					if err == nil {
+						req.Header.Set("Content-Type", "application/json")
+
+						// 附加 Headers
+						if srv.Headers != "" {
+							var headersMap map[string]string
+							if err := json.Unmarshal([]byte(srv.Headers), &headersMap); err == nil {
+								for k, v := range headersMap {
+									req.Header.Set(k, v)
+								}
+							}
+						}
+
+						resp, err := client.Do(req)
+						if err == nil {
+							defer resp.Body.Close()
+							if resp.StatusCode == http.StatusOK {
+								// 只要 HTTP 200 即证明端点联通
+								status = "online"
+							}
 						}
 					}
 				}
@@ -175,6 +204,54 @@ func GetExternalMCPTools() ([]mcp.Tool, []map[string]interface{}, map[string]mod
 	client := &http.Client{Timeout: 3 * time.Second}
 
 	for _, srv := range servers {
+		if srv.Type == "sse" {
+			// Connect via SSE and list tools
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			
+			headersMap := make(map[string]string)
+			if srv.Headers != "" {
+				_ = json.Unmarshal([]byte(srv.Headers), &headersMap)
+			}
+
+			mcpClient, err := mcpclient.NewSSEMCPClient(
+				srv.BaseURL,
+				mcpclient.WithHeaders(headersMap),
+			)
+			if err == nil {
+				if err := mcpClient.Start(ctx); err == nil {
+					initReq := mcp.InitializeRequest{}
+					initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+					initReq.Params.ClientInfo = mcp.Implementation{Name: "RedQueenSystem", Version: "1.0.0"}
+					if _, err := mcpClient.Initialize(ctx, initReq); err == nil {
+						res, err := mcpClient.ListTools(ctx, mcp.ListToolsRequest{})
+						if err == nil {
+							for _, tool := range res.Tools {
+								if tool.Name == "" {
+									continue
+								}
+								mcpTools = append(mcpTools, tool)
+
+								openAITool := map[string]interface{}{
+									"type": "function",
+									"function": map[string]interface{}{
+										"name":        tool.Name,
+										"description": tool.Description,
+										"parameters":  tool.InputSchema,
+									},
+								}
+								openAITools = append(openAITools, openAITool)
+								toolToServerMap[tool.Name] = srv
+								log.Printf("【MCP 动态发现】已成功通过 SSE 发现外部工具 [%s] (来自服务: %s)", tool.Name, srv.Name)
+							}
+						}
+					}
+				}
+				mcpClient.Close()
+			}
+			cancel()
+			continue
+		}
+
 		var req *http.Request
 		var err error
 
@@ -286,6 +363,62 @@ func GetExternalMCPTools() ([]mcp.Tool, []map[string]interface{}, map[string]mod
 // CallExternalMCPTool 转发工具调用请求至对应的外部 MCP 服务
 func CallExternalMCPTool(srv models.MCPServer, toolName string, arguments string) (string, error) {
 	log.Printf("【MCP 动态转发】正在将工具 [%s] 转发至外部服务 [%s] (%s)...", toolName, srv.Name, srv.BaseURL)
+
+	if srv.Type == "sse" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		headersMap := make(map[string]string)
+		if srv.Headers != "" {
+			_ = json.Unmarshal([]byte(srv.Headers), &headersMap)
+		}
+
+		mcpClient, err := mcpclient.NewSSEMCPClient(
+			srv.BaseURL,
+			mcpclient.WithHeaders(headersMap),
+		)
+		if err != nil {
+			return "", fmt.Errorf("创建 SSE 客户端失败: %v", err)
+		}
+		defer mcpClient.Close()
+
+		if err := mcpClient.Start(ctx); err != nil {
+			return "", fmt.Errorf("启动 SSE 客户端失败: %v", err)
+		}
+
+		initReq := mcp.InitializeRequest{}
+		initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+		initReq.Params.ClientInfo = mcp.Implementation{Name: "RedQueenSystem", Version: "1.0.0"}
+		if _, err := mcpClient.Initialize(ctx, initReq); err != nil {
+			return "", fmt.Errorf("初始化 SSE 会话失败: %v", err)
+		}
+
+		var parsedArgs map[string]interface{}
+		if err := json.Unmarshal([]byte(arguments), &parsedArgs); err != nil {
+			return "", fmt.Errorf("解析工具参数失败: %v", err)
+		}
+
+		callReq := mcp.CallToolRequest{}
+		callReq.Params.Name = toolName
+		callReq.Params.Arguments = parsedArgs
+
+		res, err := mcpClient.CallTool(ctx, callReq)
+		if err != nil {
+			return "", fmt.Errorf("SSE 工具调用执行出错: %v", err)
+		}
+
+		if len(res.Content) > 0 {
+			// 遍历返回的内容列表，提取纯文本
+			for _, content := range res.Content {
+				if textContent, ok := content.(mcp.TextContent); ok {
+					return textContent.Text, nil
+				}
+			}
+			return "已收到工具调用执行结果（非纯文本格式）", nil
+		}
+
+		return "指令已发送，但外部服务未返回提示语", nil
+	}
 
 	// 1. 构建标准的 tools/call JSON-RPC 2.0 请求
 	var parsedArgs map[string]interface{}

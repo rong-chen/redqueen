@@ -114,7 +114,7 @@ import { ElMessage } from 'element-plus';
 import request from '../utils/request';
 
 const simulateForm = ref({
-  transcript: '查询当前的天气状态',
+  transcript: '',
   confidence: 0.95,
 });
 

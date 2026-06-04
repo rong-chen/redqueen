@@ -17,3 +17,7 @@ admin-ui/node_modules/
 
 # OS
 .DS_Store
+
+# Temporary & Downloads
+scratch/
+download/
