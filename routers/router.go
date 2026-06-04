@@ -63,8 +63,8 @@ func SetupRouter(cfg config.Config) *gin.Engine {
 			voice.GET("/history", voiceCtrl.GetHistory)    // 获取历史命令列表
 		}
 
-		// 5. 实时语音 WebSocket 端点（暂不鉴权，方便开发测试；生产环境应通过 query token 鉴权）
-		api.GET("/voice/ws", voiceWSCtrl.HandleWebSocket)
+		// 5. 实时语音 WebSocket 端点（采用 Token 鉴权保护）
+		api.GET("/voice/ws", middleware.AuthRequired(), voiceWSCtrl.HandleWebSocket)
 
 		// 【新增】符合官方标准的标准 Model Context Protocol (MCP) SSE 服务器端点
 		// 允许任何外部 MCP 客户端（如 Cursor、Claude Desktop 等）连接，并自动发现和调用我们在数据库注册的所有外部工具！

@@ -13,19 +13,25 @@ import (
 func AuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
+		var token string
+
+		if authHeader != "" {
+			// 解析 Bearer 格式的 Token
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) == 2 && parts[0] == "Bearer" {
+				token = parts[1]
+			} else {
+				token = parts[0]
+			}
+		} else {
+			// 如果 Header 为空，尝试从 Query 参数中获取 (用于 WebSocket 连接)
+			token = c.Query("token")
+		}
+
+		if token == "" {
 			utils.Error(c, http.StatusUnauthorized, "请求未携带会话 Token 凭证")
 			c.Abort()
 			return
-		}
-
-		// 解析 Bearer 格式的 Token
-		parts := strings.SplitN(authHeader, " ", 2)
-		var token string
-		if len(parts) == 2 && parts[0] == "Bearer" {
-			token = parts[1]
-		} else {
-			token = parts[0]
 		}
 
 		// 检查 Token 格式有效性: 必须以 'rq_' 开头且长度匹配 hex(16) -> 32字符

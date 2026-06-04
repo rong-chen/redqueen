@@ -267,8 +267,9 @@ function stopAllAudioPlayback() {
 // WebSocket 通信
 // ---------------------------------------------------------------------------
 function getWSUrl() {
+  const token = localStorage.getItem('rq_token') || '';
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//localhost:9091/api/voice/ws?codec=pcm`;
+  return `${protocol}//localhost:9091/api/voice/ws?codec=pcm&token=${token}`;
 }
 
 function connectWebSocket() {
