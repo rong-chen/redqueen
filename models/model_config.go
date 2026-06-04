@@ -12,7 +12,4 @@ type ModelConfig struct {
 	SystemPrompt string `gorm:"type:text" json:"system_prompt"`                 // 指引大模型的 System Prompt
 	SystemRole        string `gorm:"size:100;default:'红皇后'" json:"system_role"` // 角色指定 (大模型将以此角色响应)
 	SystemPersonality string `gorm:"size:150;default:'符合皇后的语气'" json:"system_personality"` // 性格指定 (大模型将以此性格特点进行表达)
-	EnableVoiceprint    bool    `gorm:"default:false" json:"enable_voiceprint"`     // 是否开启声纹主人锁
-	VoiceprintThreshold float64 `gorm:"default:0.65" json:"voiceprint_threshold"`   // 声纹阈值限制，默认0.65
-	MasterVoiceprint    string  `gorm:"type:text" json:"master_voiceprint"`         // 主人声纹向量 (JSON string format)
 }

@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"RedQueenSystem/database"
-	"RedQueenSystem/models"
 	"RedQueenSystem/services"
 
 	"github.com/gin-gonic/gin"
@@ -53,90 +51,7 @@ type WSClientMessage struct {
 	Text string `json:"text,omitempty"` // 指令文本内容
 }
 
-// ---------------------------------------------------------------------------
-// 多设备协同唤醒仲裁器定义与实现
-// ---------------------------------------------------------------------------
 
-// WakeEvent 表示一个设备的唤醒事件，用于仲裁
-type WakeEvent struct {
-	RoomID      string
-	Volume      float64
-	Action      services.SessionAction
-	Conn        *websocket.Conn
-	WriteMu     *sync.Mutex
-	Session     *services.Session
-	Timestamp   time.Time
-	Codec       string
-	OpusEncoder *opus.Encoder
-}
-
-// VoiceArbitrator 负责处理多台设备同时被唤醒时的冲突消解
-type VoiceArbitrator struct {
-	mu          sync.Mutex
-	events      []*WakeEvent
-	arbitrating bool
-}
-
-// Submit 提交一个唤醒事件，如果在 300ms 窗口内有多个唤醒事件，将进行音量比较，只保留最响的那一个
-func (a *VoiceArbitrator) Submit(ctrl *VoiceWSController, event *WakeEvent) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	a.events = append(a.events, event)
-	log.Printf("【仲裁器】收到房间 [%s] 的唤醒事件请求, 当前平滑音量: %.2f", event.RoomID, event.Volume)
-
-	// 如果当前没有在仲裁窗口内，启动一个 300ms 的窗口
-	if !a.arbitrating {
-		a.arbitrating = true
-		time.AfterFunc(300*time.Millisecond, func() {
-			a.Resolve(ctrl)
-		})
-	}
-}
-
-// Resolve 在 300ms 窗口结束时执行仲裁决议
-func (a *VoiceArbitrator) Resolve(ctrl *VoiceWSController) {
-	a.mu.Lock()
-	events := a.events
-	a.events = nil
-	a.arbitrating = false
-	a.mu.Unlock()
-
-	if len(events) == 0 {
-		return
-	}
-
-	// 1. 寻找音量分值最高的获胜者
-	var winner *WakeEvent
-	for _, e := range events {
-		if winner == nil || e.Volume > winner.Volume {
-			winner = e
-		}
-	}
-
-	log.Printf("【仲裁器】多房间协同唤醒裁决完成！获胜者: 房间 [%s] (音量: %.2f)。本次共过滤抑制了 %d 个多余唤醒。",
-		winner.RoomID, winner.Volume, len(events)-1)
-
-	// 2. 激活并响应获胜的设备
-	ctrl.handleSessionAction(winner.Conn, winner.WriteMu, winner.Action, winner.Codec, winner.OpusEncoder, winner.RoomID)
-
-	// 3. 对所有失败的竞争者，强行使其重回休眠态，并通知客户端
-	for _, e := range events {
-		if e.RoomID != winner.RoomID {
-			log.Printf("【仲裁器】过滤/静默房间 [%s] 的唤醒事件 (音量分值偏小: %.2f)", e.RoomID, e.Volume)
-			e.Session.ForceSleep() // 重置状态机为休眠
-			ctrl.sendMessage(e.Conn, e.WriteMu, WSMessage{
-				Type:    "sleep",
-				Message: "检测到更近的房间指令，红皇后继续保持休眠",
-			})
-		}
-	}
-}
-
-// globalArbitrator 全局唯一的协同唤醒仲裁器实例
-var globalArbitrator = &VoiceArbitrator{
-	events: make([]*WakeEvent, 0),
-}
 
 // calculateVolume 计算一帧 PCM 16-bit 音频数据的平均绝对振幅（音量）
 func calculateVolume(pcmData []byte) float64 {
@@ -212,17 +127,15 @@ func (ctrl *VoiceWSController) interruptPlayback(conn *websocket.Conn, writeMu *
 //	发送: 二进制帧 = 原始 PCM 音频 (16kHz, mono, 16-bit little-endian)
 //	      建议每帧 100ms = 3200 bytes (1600 samples × 2 bytes/sample)
 //	接收: JSON 文本帧，结构见 WSMessage
+// HandleWebSocket 处理 GET /api/voice/ws —— 实时语音识别 WebSocket 端点
+//
+// 客户端协议:
+//
+//	发送: 二进制帧 = 原始 PCM 音频 (16kHz, mono, 16-bit little-endian)
+//	      建议每帧 100ms = 3200 bytes (1600 samples × 2 bytes/sample)
+//	接收: JSON 文本帧，结构见 WSMessage
 func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
-	// 1. 检查 ASR 引擎是否可用
-	asr := services.GetASR()
-	if asr == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "语音识别引擎未初始化，请检查 ASR 模型是否已正确配置",
-		})
-		return
-	}
-
-	// 2. 升级 HTTP 连接为 WebSocket
+	// 1. 升级 HTTP 连接为 WebSocket
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("【WebSocket】连接升级失败: %v", err)
@@ -263,27 +176,18 @@ func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
 		opusEncoder = enc
 	}
 
-	// 3. 创建该连接专用的 ASR 识别流
-	stream := asr.NewStream()
-	defer stream.Delete()
-
-	// 4. 创建会话状态机
+	// 2. 创建会话状态机，默认直接进入激活态
 	session := services.NewSession(ctrl.wakeWord, ctrl.sessionTimeout, room)
 
-	// 5. 启动超时检测协程
-	done := make(chan struct{})
-	defer close(done)
 	defer ctrl.stopDashScopeASR(room)
 
-	go ctrl.timeoutWatcher(conn, &writeMu, session, done)
-
-	// 6. 发送连接就绪消息
+	// 3. 发送连接就绪消息
 	ctrl.sendMessage(conn, &writeMu, WSMessage{
 		Type:    "ready",
-		Message: "语音连接就绪，请说 \"皇后\" 来唤醒",
+		Message: "语音连接就绪，安全通信链路已建立",
 	})
 
-	// 7. 主循环：持续接收并处理音频数据
+	// 4. 主循环：持续接收并处理音频数据
 	for {
 		messageType, data, err := conn.ReadMessage()
 		if err != nil {
@@ -298,7 +202,7 @@ func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
 		switch messageType {
 		case websocket.BinaryMessage:
 			// 二进制帧 = PCM / Opus 音频数据
-			ctrl.processAudioFrame(conn, &writeMu, stream, session, data, codec, opusDecoder, opusEncoder)
+			ctrl.processAudioFrame(conn, &writeMu, session, data, codec, opusDecoder, opusEncoder)
 
 		case websocket.TextMessage:
 			// 文本帧 = 控制指令（如手动唤醒/休眠，或前端 Web Speech API 识别的文本指令）
@@ -309,15 +213,10 @@ func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
 	log.Println("【WebSocket】语音连接已断开")
 }
 
-// ---------------------------------------------------------------------------
-// 音频处理核心逻辑
-// ---------------------------------------------------------------------------
-
-// processAudioFrame 处理一帧 PCM 或 Opus 音频数据
+// processAudioFrame 处理一帧 PCM 或 Opus 音频数据并发送到云端 ASR
 func (ctrl *VoiceWSController) processAudioFrame(
 	conn *websocket.Conn,
 	writeMu *sync.Mutex,
-	stream *services.ASRStream,
 	session *services.Session,
 	pcmData []byte,
 	codec string,
@@ -325,253 +224,105 @@ func (ctrl *VoiceWSController) processAudioFrame(
 	opusEncoder *opus.Encoder,
 ) {
 	var vol float64
+	var pcmToSend []byte
 
-	// 1. 若会话当前已处于激活态，将音频发送至云端高精度百炼 ASR 引擎
-	if session.GetState() == services.StateActive {
-		var pcmToSend []byte
-		if codec == "opus" {
-			if opusDecoder != nil {
-				pcmBuf := make([]int16, 1024)
-				n, err := opusDecoder.Decode(pcmData, pcmBuf)
-				if err == nil && n > 0 {
-					vol = calculateVolumeSamples(pcmBuf[:n])
-					session.UpdateVolume(vol)
-					
-					// 将 []int16 转为 []byte (Little-Endian)
-					pcmToSend = make([]byte, n*2)
-					for i, v := range pcmBuf[:n] {
-						binary.LittleEndian.PutUint16(pcmToSend[i*2:], uint16(v))
-					}
-				}
-			}
-		} else {
-			pcmToSend = pcmData
-			if len(pcmData) >= 2 && len(pcmData)%2 == 0 {
-				vol = calculateVolume(pcmData)
+	if codec == "opus" {
+		if opusDecoder != nil {
+			pcmBuf := make([]int16, 1024)
+			n, err := opusDecoder.Decode(pcmData, pcmBuf)
+			if err == nil && n > 0 {
+				vol = calculateVolumeSamples(pcmBuf[:n])
 				session.UpdateVolume(vol)
+				
+				// 将 []int16 转为 []byte (Little-Endian)
+				pcmToSend = make([]byte, n*2)
+				for i, v := range pcmBuf[:n] {
+					binary.LittleEndian.PutUint16(pcmToSend[i*2:], uint16(v))
+				}
 			}
 		}
+	} else {
+		pcmToSend = pcmData
+		if len(pcmData) >= 2 && len(pcmData)%2 == 0 {
+			vol = calculateVolume(pcmData)
+			session.UpdateVolume(vol)
+		}
+	}
 
-		if len(pcmToSend) > 0 {
-			dashscopeStream, ok := ctrl.activeASRStreams.Load(session.RoomID)
-			if !ok {
-				// 创建新的百炼 ASR 识别流
-				apiKey := os.Getenv("DASHSCOPE_API_KEY")
-				if apiKey == "" {
-					apiKey = "sk-41cd73b8bae44957aa31542e03f1521e"
-				}
-				var err error
-				newStream, err := services.NewDashScopeASRStream(apiKey, func(text string, isFinal bool) {
-					if isFinal {
-						log.Printf("【百炼 ASR 最终转写】%s", text)
+	if len(pcmToSend) > 0 {
+		dashscopeStream, ok := ctrl.activeASRStreams.Load(session.RoomID)
+		if !ok {
+			// 创建新的百炼 ASR 识别流
+			apiKey := os.Getenv("DASHSCOPE_API_KEY")
+			if apiKey == "" {
+				apiKey = "sk-41cd73b8bae44957aa31542e03f1521e"
+			}
+			var err error
+			newStream, err := services.NewDashScopeASRStream(apiKey, func(text string, isFinal bool) {
+				if isFinal {
+					log.Printf("【百炼 ASR 最终转写】%s", text)
 
-						// 声纹匹配校验
-						var pcmSamples []int16
-						if val, ok := ctrl.activeASRStreams.Load(session.RoomID); ok {
-							if ds, ok := val.(*services.DashScopeASRStream); ok {
-								pcmSamples = ds.GetAndClearAudio()
-							}
+					// 校验是否在回复生成或播报状态中，杜绝自反馈环路
+					isReplying := ctrl.IsReplying(session.RoomID)
+					interruptWords := []string{"退下", "别说了", "闭嘴", "停", "不要", "安静", "再见"}
+					hasInterruptWord := false
+					for _, w := range interruptWords {
+						if strings.Contains(text, w) {
+							hasInterruptWord = true
+							break
 						}
+					}
 
-						pass, score, vpErr := ctrl.verifyVoiceprintCheck(pcmSamples)
-						if vpErr != nil {
-							log.Printf("[声纹主人锁] 指令校验异常: %v", vpErr)
-						} else if !pass {
-							log.Printf("【声纹拦截】判定为电视杂音或旁人说话(相似度: %.2f)，静默忽略此指令！", score)
-							// 向前端发送声纹拦截消息，方便前端调试/提示
+					if isReplying {
+						if hasInterruptWord {
+							log.Printf("【打断机制】检测到用户说话打断: %s，即刻终止当前播放！", text)
+							ctrl.interruptPlayback(conn, writeMu, session.RoomID)
 							ctrl.sendMessage(conn, writeMu, WSMessage{
-								Type:    "voiceprint_blocked",
-								Message: fmt.Sprintf("声纹未匹配(相似度: %.2f)", score),
+								Type:    "interrupt",
+								Message: "语音流被打断，接收全新指令",
 							})
-							return
-						} else if score > 0 {
-							log.Printf("【声纹通过】主人声纹识别校验通过，相似度: %.2f", score)
 						}
-						
-						// 校验是否在回复生成或播报状态中，杜绝自反馈环路
-						isReplying := ctrl.IsReplying(session.RoomID)
-						interruptWords := []string{"退下", "别说了", "闭嘴", "停", "不要", "安静", "再见"}
-						hasInterruptWord := false
-						for _, w := range interruptWords {
-							if strings.Contains(text, w) {
-								hasInterruptWord = true
-								break
-							}
-						}
+						return
+					}
 
-						if isReplying {
-							if hasInterruptWord {
-								log.Printf("【打断机制】检测到用户说话打断: %s，即刻终止当前播放！", text)
-								ctrl.interruptPlayback(conn, writeMu, session.RoomID)
-								ctrl.sendMessage(conn, writeMu, WSMessage{
-									Type:    "interrupt",
-									Message: "语音流被打断，接收全新指令",
-								})
-							}
-							return
-						}
+					// 发送给前端显示最终结果
+					ctrl.sendMessage(conn, writeMu, WSMessage{
+						Type: "final",
+						Text: text,
+					})
 
-						// 发送给前端显示最终结果
+					// 过滤单字
+					if len([]rune(text)) <= 1 {
+						log.Printf("【ASR】过滤单字或超短识别结果: %s", text)
+						return
+					}
+
+					// 触发打断
+					ctrl.interruptPlayback(conn, writeMu, session.RoomID)
+
+					// 状态机处理指令
+					action := session.ProcessText(text)
+					ctrl.handleSessionAction(conn, writeMu, action, codec, opusEncoder, session.RoomID)
+				} else {
+					// 处于正常交互状态时，向前端发送中间文字，提供打字机回显
+					if !ctrl.IsReplying(session.RoomID) {
 						ctrl.sendMessage(conn, writeMu, WSMessage{
-							Type: "final",
+							Type: "partial",
 							Text: text,
 						})
-
-						// 过滤单字
-						if len([]rune(text)) <= 1 {
-							log.Printf("【ASR】过滤单字或超短识别结果: %s", text)
-							return
-						}
-
-						// 触发打断
-						ctrl.interruptPlayback(conn, writeMu, session.RoomID)
-
-						// 状态机处理指令
-						action := session.ProcessText(text)
-						ctrl.handleSessionAction(conn, writeMu, action, codec, opusEncoder, session.RoomID)
-					} else {
-						// 处于正常交互状态时，向前端发送中间文字，提供打字机回显
-						if !ctrl.IsReplying(session.RoomID) {
-							ctrl.sendMessage(conn, writeMu, WSMessage{
-								Type: "partial",
-								Text: text,
-							})
-						}
 					}
-				})
-				if err != nil {
-					log.Printf("【百炼 ASR】初始化流识别会话失败: %v", err)
-					return
 				}
-				ctrl.activeASRStreams.Store(session.RoomID, newStream)
-				dashscopeStream = newStream
-			}
-
-			if ds, ok := dashscopeStream.(*services.DashScopeASRStream); ok {
-				_ = ds.SendAudio(pcmToSend)
-			}
-		}
-		return
-	}
-
-	// 2. 根据编码格式进行数据解析与音量计算
-	if codec == "opus" {
-		if opusDecoder == nil {
-			return
-		}
-		// 每次 20ms @ 16kHz 为 320 采样点，使用 1024 大小缓冲区绰绰有余
-		pcmBuf := make([]int16, 1024)
-		n, err := opusDecoder.Decode(pcmData, pcmBuf)
-		if err != nil {
-			log.Printf("【ASR】Opus 音频帧解码失败: %v", err)
-			return
-		}
-		if n <= 0 {
-			return
-		}
-		vol = calculateVolumeSamples(pcmBuf[:n])
-		session.UpdateVolume(vol)
-
-		// 2. 直接将解码出的采样喂入 ASR
-		stream.FeedSamples(pcmBuf[:n])
-	} else {
-		// 数据校验：PCM 16-bit 要求字节数为偶数
-		if len(pcmData) < 2 || len(pcmData)%2 != 0 {
-			return
-		}
-		vol = calculateVolume(pcmData)
-		session.UpdateVolume(vol)
-
-		// 2. 将 PCM 音频喂入 Sherpa-onnx 识别引擎
-		stream.FeedAudio(pcmData)
-	}
-
-	// 3. 执行解码（处理缓冲区中的所有就绪帧）
-	stream.Decode()
-
-	// 4. 获取实时中间识别结果
-	partialText := stream.GetResult()
-	if partialText != "" {
-		// 【打断机制】当正在播放大模型音频时，若 ASR 检测到非空中间文字，瞬间打断
-		if _, ok := ctrl.activeCancels.Load(session.RoomID); ok {
-			log.Printf("【打断机制】检测到用户说话 (ASR 中间文字: \"%s\")，即刻终止当前播放！", partialText)
-			ctrl.interruptPlayback(conn, writeMu, session.RoomID)
-		}
-
-		ctrl.sendMessage(conn, writeMu, WSMessage{
-			Type: "partial",
-			Text: partialText,
-		})
-	}
-
-	// 5. 检查是否检测到语句结束（用户停顿超过阈值）
-	if stream.IsEndpoint() {
-		finalText := stream.GetResult()
-		
-		// 在 stream.Reset() 之前取出当前句子的音频缓存
-		pcmSamples := stream.GetAndClearAudio()
-
-		stream.Reset() // 重置流，准备识别下一句
-
-		if finalText == "" {
-			return
-		}
-
-		// 过滤单字或超短的误触发识别（例如“天”等碎片分片），防止不完整的片段执行或导致打断误判
-		if len([]rune(finalText)) <= 1 {
-			log.Printf("【ASR】过滤单字或超短识别结果: %s", finalText)
-			return
-		}
-
-		log.Printf("【ASR 识别完成】%s", finalText)
-
-		// 发送最终识别结果
-		ctrl.sendMessage(conn, writeMu, WSMessage{
-			Type: "final",
-			Text: finalText,
-		})
-
-		// 【打断机制】如果是在 ASR 最终确定时仍有播放活动，也进行最终二次打断清理
-		ctrl.interruptPlayback(conn, writeMu, session.RoomID)
-
-		// 6. 通过会话状态机判断该如何处理
-		action := session.ProcessText(finalText)
-
-		// 声纹匹配校验（仅在唤醒事件发生时）
-		if action.Type == services.ActionWake || action.Type == services.ActionWakeAndExecute {
-			pass, score, vpErr := ctrl.verifyVoiceprintCheck(pcmSamples)
-			if vpErr != nil {
-				log.Printf("[声纹主人锁] 唤醒校验异常: %v", vpErr)
-			} else if !pass {
-				log.Printf("【声纹拦截】唤醒词判定为电视杂音或旁人说话(相似度: %.2f)，拒绝唤醒！", score)
-				session.ForceSleep() // 强制重置为休眠
-				ctrl.sendMessage(conn, writeMu, WSMessage{
-					Type:    "voiceprint_blocked",
-					Message: fmt.Sprintf("唤醒声纹不匹配(相似度: %.2f)", score),
-				})
+			})
+			if err != nil {
+				log.Printf("【百炼 ASR】初始化流识别会话失败: %v", err)
 				return
-			} else if score > 0 {
-				log.Printf("【声纹通过】唤醒声纹校验通过，相似度: %.2f", score)
 			}
+			ctrl.activeASRStreams.Store(session.RoomID, newStream)
+			dashscopeStream = newStream
 		}
 
-		// 7. 多设备协同唤醒仲裁
-		if action.Type == services.ActionWake || action.Type == services.ActionWakeAndExecute {
-			event := &WakeEvent{
-				RoomID:      session.RoomID,
-				Volume:      session.GetMaxVolume(),
-				Action:      action,
-				Conn:        conn,
-				WriteMu:     writeMu,
-				Session:     session,
-				Timestamp:   time.Now(),
-				Codec:       codec,
-				OpusEncoder: opusEncoder,
-			}
-			globalArbitrator.Submit(ctrl, event)
-		} else {
-			// 普通控制指令或休眠指令，无需仲裁，直接执行
-			ctrl.handleSessionAction(conn, writeMu, action, codec, opusEncoder, session.RoomID)
+		if ds, ok := dashscopeStream.(*services.DashScopeASRStream); ok {
+			_ = ds.SendAudio(pcmToSend)
 		}
 	}
 }
@@ -590,47 +341,13 @@ func (ctrl *VoiceWSController) handleSessionAction(
 	roomID string,
 ) {
 	switch action.Type {
-	case services.ActionIgnore:
-		// 休眠态且无唤醒词，不处理
-
-	case services.ActionWake:
-		// 唤醒成功，但没有附带指令
-		log.Println("【会话】红皇后已唤醒，等待指令...")
-		wakeMsg := "红皇后已唤醒，静候指示"
-		ctrl.sendMessage(conn, writeMu, WSMessage{
-			Type:    "wake",
-			Message: wakeMsg,
-		})
-		// 异步合成语音并推送给硬件设备扬声器
-		go ctrl.streamAudioToClient(conn, writeMu, wakeMsg, codec, opusEncoder, roomID)
-
-	case services.ActionWakeAndExecute:
-		// 唤醒成功且附带指令（如 "皇后帮我开灯"）
-		log.Printf("【会话】唤醒并执行指令: %s", action.Command)
-		ctrl.sendMessage(conn, writeMu, WSMessage{
-			Type:    "wake",
-			Message: "红皇后已唤醒，正在处理指令...",
-		})
-		go ctrl.executeCommand(conn, writeMu, action.Command, codec, opusEncoder, roomID)
-
 	case services.ActionExecute:
 		// 激活态中收到指令
 		log.Printf("【会话】执行指令: %s", action.Command)
 		go ctrl.executeCommand(conn, writeMu, action.Command, codec, opusEncoder, roomID)
-
-	case services.ActionSleep:
-		// 用户主动结束对话
-		log.Println("【会话】红皇后已休眠")
-		ctrl.stopDashScopeASR(roomID)
-		sleepMsg := "红皇后已休眠，如需帮助请再次呼唤"
-		ctrl.sendMessage(conn, writeMu, WSMessage{
-			Type:    "sleep",
-			Message: sleepMsg,
-		})
-		// 异步合成语音并推送给硬件设备扬声器
-		go ctrl.streamAudioToClient(conn, writeMu, sleepMsg, codec, opusEncoder, roomID)
 	}
 }
+
 
 // executeCommand 将指令文本发送给 NLP 解析并执行硬件控制
 // 采用流式管线架构：大模型逐句输出 → 实时 TTS 合成 → 立刻推送音频，三者并行
@@ -726,16 +443,16 @@ func (ctrl *VoiceWSController) executeCommand(
 			shouldSynth = len(strings.TrimSpace(currentSentence)) > 0
 		} else if len(currentSentence) > 0 {
 			lastRune := []rune(currentSentence)
-			// 1. 遇到句末标点立即断句
+			// 1. 遇到句末强标点立即断句
 			if len(lastRune) > 0 && strings.ContainsRune(sentenceEnders, lastRune[len(lastRune)-1]) {
 				shouldSynth = true
 			}
-			// 2. 逗号/顿号处断句字数下调为 4 个字 (避免停顿时间过长)
-			if !shouldSynth && len(lastRune) >= 4 && strings.ContainsRune("，、,", lastRune[len(lastRune)-1]) {
+			// 2. 遇到逗号/顿号，且累积字数达到 15 个字以上才断句 (提升语气连贯性)
+			if !shouldSynth && len(lastRune) >= 15 && strings.ContainsRune("，、,", lastRune[len(lastRune)-1]) {
 				shouldSynth = true
 			}
-			// 3. 达到 12 个字强制断句，确保无标点长句也能极其流畅快速开口
-			if !shouldSynth && len(lastRune) >= 12 {
+			// 3. 无标点长句，达到 25 个字才强制断句 (确保 CosyVoice 具有充足语境)
+			if !shouldSynth && len(lastRune) >= 25 {
 				shouldSynth = true
 			}
 		}
@@ -865,16 +582,16 @@ func (ctrl *VoiceWSController) executeCommand(
 					shouldSynth = len(strings.TrimSpace(currentSentence)) > 0
 				} else if len(currentSentence) > 0 {
 					lastRune := []rune(currentSentence)
-					// 1. 遇到句末标点立即断句
+					// 1. 遇到句末强标点立即断句
 					if len(lastRune) > 0 && strings.ContainsRune(sentenceEnders, lastRune[len(lastRune)-1]) {
 						shouldSynth = true
 					}
-					// 2. 逗号/顿号处断句字数下调为 4 个字 (避免停顿时间过长)
-					if !shouldSynth && len(lastRune) >= 4 && strings.ContainsRune("，、,", lastRune[len(lastRune)-1]) {
+					// 2. 遇到逗号/顿号，且累积字数达到 15 个字以上才断句 (提升语气连贯性)
+					if !shouldSynth && len(lastRune) >= 15 && strings.ContainsRune("，、,", lastRune[len(lastRune)-1]) {
 						shouldSynth = true
 					}
-					// 3. 达到 12 个字强制断句，确保无标点长句也能极其流畅快速开口
-					if !shouldSynth && len(lastRune) >= 12 {
+					// 3. 无标点长句，达到 25 个字才强制断句 (确保 CosyVoice 具有充足语境)
+					if !shouldSynth && len(lastRune) >= 25 {
 						shouldSynth = true
 					}
 				}
@@ -1026,9 +743,6 @@ func (ctrl *VoiceWSController) processControlMessage(
 			isSpeaking := clientMsg.Text == "true"
 			log.Printf("【WebSocket】收到前端朗读状态同步 speaking_status: %v", isSpeaking)
 			session.SetSpeaking(isSpeaking)
-			if isSpeaking {
-				session.RefreshActiveTime()
-			}
 		case "interrupt":
 			log.Printf("【打断机制】收到客户端 JSON 打断指令，停止房间 [%s] 的当前播放", session.RoomID)
 			ctrl.interruptPlayback(conn, writeMu, session.RoomID)
@@ -1044,14 +758,6 @@ func (ctrl *VoiceWSController) processControlMessage(
 	// 2. 如果不是 JSON 格式，回退到原有的简单文本控制指令
 	cmd := string(data)
 	switch cmd {
-	case "wake":
-		// 手动唤醒（调试用）
-		action := session.ProcessText(session.WakeWord)
-		ctrl.handleSessionAction(conn, writeMu, action, codec, opusEncoder, session.RoomID)
-	case "sleep":
-		// 手动休眠
-		action := session.ProcessText("好了")
-		ctrl.handleSessionAction(conn, writeMu, action, codec, opusEncoder, session.RoomID)
 	case "ping":
 		ctrl.sendMessage(conn, writeMu, WSMessage{
 			Type:    "pong",
@@ -1068,42 +774,6 @@ func (ctrl *VoiceWSController) processControlMessage(
 func (ctrl *VoiceWSController) IsReplying(roomID string) bool {
 	_, ok := ctrl.activeCancels.Load(roomID)
 	return ok
-}
-
-// ---------------------------------------------------------------------------
-// 超时检测与消息发送
-// ---------------------------------------------------------------------------
-
-// timeoutWatcher 后台协程，定期检查激活态是否已超时
-func (ctrl *VoiceWSController) timeoutWatcher(
-	conn *websocket.Conn,
-	writeMu *sync.Mutex,
-	session *services.Session,
-	done <-chan struct{},
-) {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// 如果大模型正在生成回复，或者前端正在播放语音，则不断重置活跃时间戳，防止自动超时休眠
-			if ctrl.IsReplying(session.RoomID) || session.IsSpeakingGetter() {
-				session.RefreshActiveTime()
-			}
-
-			if session.CheckTimeout() {
-				log.Println("【会话】超时自动休眠")
-				ctrl.stopDashScopeASR(session.RoomID)
-				ctrl.sendMessage(conn, writeMu, WSMessage{
-					Type:    "sleep",
-					Message: "红皇后已因超时休眠，如需帮助请再次呼唤",
-				})
-			}
-		case <-done:
-			return
-		}
-	}
 }
 
 // sendMessage 线程安全地向 WebSocket 客户端发送 JSON 消息
@@ -1282,69 +952,5 @@ func (ctrl *VoiceWSController) stopDashScopeASR(roomID string) {
 		}
 		ctrl.activeASRStreams.Delete(roomID)
 	}
-}
-
-// verifyVoiceprintCheck 校验声纹，返回是否通过以及分数
-func (ctrl *VoiceWSController) verifyVoiceprintCheck(pcmSamples []int16) (bool, float64, error) {
-	var cfg models.ModelConfig
-	if err := database.DB.First(&cfg).Error; err != nil {
-		return true, 0.0, fmt.Errorf("读取配置失败: %w", err)
-	}
-
-	if !cfg.EnableVoiceprint {
-		return true, 0.0, nil
-	}
-
-	if cfg.MasterVoiceprint == "" {
-		log.Println("【声纹锁】虽然启用了声纹主人锁，但数据库中尚未注册主人声纹，暂时自动放行...")
-		return true, 0.0, nil
-	}
-
-	// 反序列化主人声纹（多条声纹格式: [][]float32）
-	var allEmbs [][]float32
-	if err := json.Unmarshal([]byte(cfg.MasterVoiceprint), &allEmbs); err != nil {
-		// 兼容旧的单条格式 []float32
-		var singleEmb []float32
-		if err2 := json.Unmarshal([]byte(cfg.MasterVoiceprint), &singleEmb); err2 == nil && len(singleEmb) > 0 {
-			allEmbs = [][]float32{singleEmb}
-		} else {
-			return true, 0.0, fmt.Errorf("解析主人声纹向量失败: %w", err)
-		}
-	}
-
-	if len(allEmbs) == 0 {
-		return true, 0.0, nil
-	}
-
-	vpSvc := services.GetVoiceprint()
-	if vpSvc == nil {
-		return true, 0.0, fmt.Errorf("声纹提取服务未就绪")
-	}
-
-	emb, err := vpSvc.ExtractEmbedding(pcmSamples)
-	if err != nil {
-		log.Printf("【声纹锁】声纹提取失败(可能音频过短): %v，暂时放行", err)
-		return true, 0.0, nil
-	}
-
-	// 与所有已建档声纹比对，取最高相似度
-	var maxScore float64
-	for _, masterEmb := range allEmbs {
-		score := vpSvc.VerifySpeaker(masterEmb, emb)
-		if score > maxScore {
-			maxScore = score
-		}
-	}
-
-	threshold := cfg.VoiceprintThreshold
-	if threshold == 0 {
-		threshold = 0.65
-	}
-
-	if maxScore < threshold {
-		return false, maxScore, nil
-	}
-
-	return true, maxScore, nil
 }
 

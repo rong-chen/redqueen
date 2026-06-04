@@ -123,7 +123,6 @@ func seedModelConfig(db *gorm.DB) error {
 			SystemPrompt:        defaultPrompt,
 			SystemRole:          "红皇后",
 			SystemPersonality:   defaultPersonality,
-			VoiceprintThreshold: 0.65, // 默认阈值
 		}
 
 		if err := db.Create(&cfg).Error; err != nil {
@@ -153,10 +152,6 @@ func seedModelConfig(db *gorm.DB) error {
 			}
 			if cfg.SystemPersonality == "" {
 				cfg.SystemPersonality = defaultPersonality
-				needsUpdate = true
-			}
-			if cfg.VoiceprintThreshold == 0.0 {
-				cfg.VoiceprintThreshold = 0.65
 				needsUpdate = true
 			}
 			if needsUpdate {

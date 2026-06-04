@@ -11,7 +11,6 @@ type Config struct {
 	DBDriver       string // 数据库驱动类型: "postgres"
 	DBSource       string // PostgreSQL 连接 DSN
 	AllowOrigins   string // 允许的跨域来源
-	ASRModelDir    string // Sherpa-onnx ASR 模型文件目录路径
 	WakeWord       string // 语音唤醒词，默认 "皇后"
 	SessionTimeout int    // 语音会话激活态超时秒数，默认 15
 }
@@ -43,12 +42,6 @@ func LoadConfig() Config {
 		allowOrigins = "*"
 	}
 
-	// ASR 语音识别配置
-	asrModelDir := os.Getenv("ASR_MODEL_DIR")
-	if asrModelDir == "" {
-		asrModelDir = "models/asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
-	}
-
 	wakeWord := os.Getenv("WAKE_WORD")
 	if wakeWord == "" {
 		wakeWord = "皇后"
@@ -66,7 +59,6 @@ func LoadConfig() Config {
 		DBDriver:       dbDriver,
 		DBSource:       dbSource,
 		AllowOrigins:   allowOrigins,
-		ASRModelDir:    asrModelDir,
 		WakeWord:       wakeWord,
 		SessionTimeout: sessionTimeout,
 	}
