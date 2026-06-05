@@ -7,5 +7,10 @@ export default defineConfig({
   server: {
     port: 9092,
     strictPort: false, // 若 9092 被占用，自动换其它端口启动
+  },
+  resolve: {
+    alias: {
+      '@tensorflow/tfjs-tflite': 'node_modules/@tensorflow/tfjs-tflite/dist/tf-tflite.fesm.js',
+    },
   }
 })

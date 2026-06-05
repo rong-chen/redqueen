@@ -21,6 +21,14 @@
           <el-icon><Headset /></el-icon>
           <span>实时语音交互</span>
         </el-menu-item>
+        <el-menu-item index="/voiceprint-enroll">
+          <el-icon><User /></el-icon>
+          <span>声纹管理注册</span>
+        </el-menu-item>
+        <el-menu-item index="/wakeword-recorder">
+          <el-icon><Microphone /></el-icon>
+          <span>本地唤醒词采集录音机</span>
+        </el-menu-item>
 
         <el-menu-item index="/mcp-servers">
           <el-icon><Connection /></el-icon>
@@ -70,7 +78,7 @@
 <script setup>
 import { computed, ref, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { Microphone, Headset, Setting, Connection, ArrowDown } from '@element-plus/icons-vue';
+import { Microphone, Headset, Setting, Connection, ArrowDown, User } from '@element-plus/icons-vue';
 import { ElMessageBox, ElMessage } from 'element-plus';
 
 const route = useRoute();
@@ -92,6 +100,10 @@ const currentRouteName = computed(() => {
     return '实时语音交互 — 红皇后';
   } else if (route.path === '/mcp-servers') {
     return '外部 MCP 发现与服务管理看板';
+  } else if (route.path === '/voiceprint-enroll') {
+    return '专属唤醒声纹注册与采集';
+  } else if (route.path === '/wakeword-recorder') {
+    return '本地专属唤醒词采集录音机 (16kHz WAV)';
   } else if (route.path === '/model-config') {
     return '语音与 NLU 大模型参数配置';
   }

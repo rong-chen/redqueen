@@ -36,6 +36,7 @@ func SetupRouter(cfg config.Config) *gin.Engine {
 	voiceWSCtrl := controllers.NewVoiceWSController(cfg.WakeWord, cfg.SessionTimeout) // 实时语音 WebSocket 控制器
 	configCtrl := controllers.NewConfigController()
 	mcpServerCtrl := controllers.NewMCPServerController()     // 新增：外部 MCP 服务控制器
+	vpCtrl := controllers.NewVoiceprintController()           // 新增：声纹控制器
 
 	// 健康检查测试端点
 	r.GET("/", func(c *gin.Context) {
@@ -61,6 +62,13 @@ func SetupRouter(cfg config.Config) *gin.Engine {
 		{
 			voice.POST("/command", voiceCtrl.CreateCommand) // 保存并解析语音命令
 			voice.GET("/history", voiceCtrl.GetHistory)    // 获取历史命令列表
+		}
+
+		// 新增：受保护的声纹管理接口组
+		voiceprint := api.Group("/voiceprint")
+		voiceprint.Use(middleware.AuthRequired()) // 接入鉴权拦截器
+		{
+			voiceprint.POST("/enroll", vpCtrl.EnrollVoiceprint) // 录入声纹
 		}
 
 		// 5. 实时语音 WebSocket 端点（采用 Token 鉴权保护）

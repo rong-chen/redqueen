@@ -12,6 +12,7 @@ import (
 	"RedQueenSystem/database"
 	"RedQueenSystem/models"
 	"RedQueenSystem/services"
+	"RedQueenSystem/utils"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -47,6 +48,14 @@ type WSMessage struct {
 type WSClientMessage struct {
 	Type string `json:"type"`           // 消息类型: command, interrupt, ping
 	Text string `json:"text,omitempty"` // 指令文本内容
+}
+
+// VoiceprintAuthState 记录每个 WebSocket 连接的声纹鉴权状态
+type VoiceprintAuthState struct {
+	IsAuthenticated  bool
+	AuthBuffer       []int16
+	MasterVoiceprint []float32
+	HasMaster        bool
 }
 
 // calculateVolume 计算一帧 PCM 16-bit 音频数据的平均绝对振幅（音量）
@@ -158,8 +167,24 @@ func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
 
 	// 创建本地会话状态管理
 	session := services.NewSession(ctrl.wakeWord, ctrl.sessionTimeout, room)
-
 	defer ctrl.stopQwenOmniSession(room)
+
+	var authState VoiceprintAuthState
+	// 从数据库加载 MasterVoiceprint
+	var admin models.User
+	if err := database.DB.Where("role = ?", "admin").First(&admin).Error; err == nil && admin.MasterVoiceprint != "" {
+		var master []float32
+		if err := json.Unmarshal([]byte(admin.MasterVoiceprint), &master); err == nil && len(master) > 0 {
+			authState.MasterVoiceprint = master
+			authState.HasMaster = true
+		}
+	}
+
+	// 如果没有录入过声纹，默认放行
+	if !authState.HasMaster {
+		authState.IsAuthenticated = true
+		log.Println("【Voiceprint】未检测到 MasterVoiceprint，默认放行连接")
+	}
 
 	// 发送连接就绪消息
 	ctrl.sendMessage(conn, &writeMu, WSMessage{
@@ -181,7 +206,7 @@ func (ctrl *VoiceWSController) HandleWebSocket(c *gin.Context) {
 
 		switch messageType {
 		case websocket.BinaryMessage:
-			ctrl.processAudioFrame(conn, &writeMu, session, data, codec, opusDecoder, opusEncoder)
+			ctrl.processAudioFrame(conn, &writeMu, session, &authState, data, codec, opusDecoder, opusEncoder)
 
 		case websocket.TextMessage:
 			ctrl.processControlMessage(conn, &writeMu, session, data, codec, opusEncoder)
@@ -196,6 +221,7 @@ func (ctrl *VoiceWSController) processAudioFrame(
 	conn *websocket.Conn,
 	writeMu *sync.Mutex,
 	session *services.Session,
+	authState *VoiceprintAuthState,
 	pcmData []byte,
 	codec string,
 	opusDecoder *opus.Decoder,
@@ -221,6 +247,67 @@ func (ctrl *VoiceWSController) processAudioFrame(
 
 	if len(pcm16Data) == 0 {
 		return
+	}
+
+	// 转为 int16 样本
+	samples := make([]int16, len(pcm16Data)/2)
+	for j := 0; j < len(samples); j++ {
+		samples[j] = int16(pcm16Data[j*2]) | (int16(pcm16Data[j*2+1]) << 8)
+	}
+
+	// 1.5 声纹网关拦截：未鉴权时缓存并校验
+	if !authState.IsAuthenticated && authState.HasMaster {
+		authState.AuthBuffer = append(authState.AuthBuffer, samples...)
+		// 累积满 1.5 秒音频 (约 24000 个采样)
+		if len(authState.AuthBuffer) >= 24000 {
+			vpSvc := services.GetVoiceprint()
+			if vpSvc != nil {
+				trimmed := utils.TrimSilence(authState.AuthBuffer)
+				if len(trimmed) > 8000 { // 至少包含 0.5 秒的有效人声
+					emb, err := vpSvc.ExtractEmbedding(trimmed)
+					if err == nil {
+						sim := vpSvc.VerifySpeaker(emb, authState.MasterVoiceprint)
+						log.Printf("【Voiceprint Gatekeeper】声纹相似度检测完毕: %f", sim)
+						if sim > 0.55 { // 阈值 0.55
+							authState.IsAuthenticated = true
+							ctrl.sendMessage(conn, writeMu, WSMessage{
+								Type: "auth_success", Message: "声纹验证通过，已授权接入红皇后系统！",
+							})
+						} else {
+							ctrl.sendMessage(conn, writeMu, WSMessage{
+								Type: "auth_failed", Message: "声纹校验未通过，识别为非授权人员，拒绝接入",
+							})
+							_ = conn.Close()
+							return
+						}
+					}
+				}
+			}
+			// 如果提取失败、人声不够或者还在等待
+			if !authState.IsAuthenticated {
+				// 滑动窗口：丢弃最旧的 0.5 秒数据，继续等待新音频
+				if len(authState.AuthBuffer) > 8000 {
+					authState.AuthBuffer = authState.AuthBuffer[8000:]
+				}
+				return
+			}
+		} else {
+			// 音频长度不够 1.5 秒，继续缓冲
+			return
+		}
+	}
+
+	// 将当前要发送的数据整理好（如果是刚刚通过鉴权，则发送累积的 Buffer；否则只发送当前帧）
+	var dataToSend []byte
+	if len(authState.AuthBuffer) > 0 {
+		dataToSend = make([]byte, len(authState.AuthBuffer)*2)
+		for i, s := range authState.AuthBuffer {
+			dataToSend[i*2] = byte(s)
+			dataToSend[i*2+1] = byte(s >> 8)
+		}
+		authState.AuthBuffer = nil // 发送完毕后清空
+	} else {
+		dataToSend = pcm16Data
 	}
 
 	// 记录并通知音量用于前台波形绘制
@@ -324,7 +411,7 @@ func (ctrl *VoiceWSController) processAudioFrame(
 	}
 
 	// 3. 将音频帧推入 Qwen-Omni
-	_ = omniSession.SendAudioChunk(pcm16Data)
+	_ = omniSession.SendAudioChunk(dataToSend)
 }
 
 // processControlMessage 处理客户端发送的文本控制或打断指令

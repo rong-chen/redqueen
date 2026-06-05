@@ -6,6 +6,7 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/k2-fsa/sherpa-onnx-go v1.13.2
 	github.com/mark3labs/mcp-go v0.54.1
 	golang.org/x/crypto v0.52.0
 	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302
@@ -33,6 +34,9 @@ require (
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-linux v1.13.2 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-macos v1.13.2 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-windows v1.13.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

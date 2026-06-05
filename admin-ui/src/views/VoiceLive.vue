@@ -25,7 +25,24 @@
             <div class="pulse-ring ring-2"></div>
           </div>
           <div class="btn-hint">
-            {{ isConnected ? '点击断开语音信道' : '点击授权麦克风并连接' }}
+            {{ isConnected ? '点击断开信道' : (isListeningWakeWord ? '点击关闭监听' : '点击激活唤醒词监听') }}
+          </div>
+        </div>
+
+        <!-- 唤醒模型设置 -->
+        <div class="model-settings">
+          <input 
+            type="file" 
+            ref="fileInput"
+            style="display: none" 
+            accept=".tflite" 
+            @change="handleWakeWordUpload" 
+          />
+          <el-button size="small" type="primary" plain @click="$refs.fileInput.click()">
+            <el-icon><Upload /></el-icon> 加载自定义唤醒词 (.tflite)
+          </el-button>
+          <div class="current-model-hint">
+            当前唤醒词模型: <strong>{{ customModelName || '默认模型 (Okay Nabu)' }}</strong>
           </div>
         </div>
 
@@ -53,18 +70,25 @@
 
 <script setup>
 import { ref, onUnmounted, computed } from 'vue';
-import { Microphone, VideoPause } from '@element-plus/icons-vue';
+import { Microphone, VideoPause, Upload } from '@element-plus/icons-vue';
 import { ElMessage } from 'element-plus';
+import { UWW } from 'uww.js';
 
 // ---------------------------------------------------------------------------
 // 状态与响应式变量
 // ---------------------------------------------------------------------------
 const isConnected = ref(false);
 const isRecording = ref(false);
+const isListeningWakeWord = ref(false); // 是否在本地监听唤醒词
 const currentText = ref('');       // 实时识别/转写文字
 const isFinal = ref(false);        // 是否为最终转写
 const isSpeaking = ref(false);      // 正在播放答复语音
 const aiReplyText = ref('');       // 智能体文字回复
+
+// 唤醒词相关
+const customModelName = ref('');
+let customModelBuffer = null;
+let uwwInstance = null;
 
 // ---------------------------------------------------------------------------
 // 原生多媒体与 Web Audio 状态
@@ -82,43 +106,130 @@ let nextPlaybackTime = 0;
 // 计算属性
 // ---------------------------------------------------------------------------
 const statusTitle = computed(() => {
-  if (!isConnected.value) return '系统已离线';
+  if (!isListeningWakeWord.value && !isConnected.value) return '系统已离线';
   if (isSpeaking.value) return '红皇后播音中...';
-  if (isRecording.value) return '麦克风监听中，请说话...';
+  if (isConnected.value && isRecording.value) return '已唤醒！通道就绪，指令执行中...';
+  if (isListeningWakeWord.value && !isConnected.value) return '本地静默监听唤醒词中...';
   return '通道就绪，静默中';
 });
 
 const statusDotClass = computed(() => ({
   'dot-active': isConnected.value && isRecording.value,
   'dot-speaking': isConnected.value && isSpeaking.value,
-  'dot-disconnected': !isConnected.value,
+  'dot-listening': isListeningWakeWord.value && !isConnected.value,
+  'dot-disconnected': !isListeningWakeWord.value && !isConnected.value,
 }));
+
+// ---------------------------------------------------------------------------
+// 模型加载
+// ---------------------------------------------------------------------------
+function handleWakeWordUpload(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    customModelBuffer = e.target.result;
+    customModelName.value = file.name;
+    ElMessage.success(`成功加载唤醒词模型: ${file.name}`);
+  };
+  reader.readAsArrayBuffer(file);
+}
 
 // ---------------------------------------------------------------------------
 // 连接控制与切换
 // ---------------------------------------------------------------------------
 async function handleConnectionToggle() {
-  if (isConnected.value) {
+  if (isListeningWakeWord.value || isConnected.value) {
     stopVoice();
   } else {
-    await startVoice();
+    await startListeningWakeWord();
   }
 }
 
-async function startVoice() {
+async function startListeningWakeWord() {
   try {
     currentText.value = '';
     aiReplyText.value = '';
-    await startMicrophone();
-    await connectWebSocket();
-    ElMessage.success('安全语音信道激活成功');
+    
+    // 提前开启麦克风
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        sampleRate: 16000,
+        channelCount: 1,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: true,
+      },
+    });
+
+    isListeningWakeWord.value = true;
+    ElMessage.info(`开始离线监听唤醒词`);
+
+    // 初始化本地唤醒引擎 uww.js
+    const wakeWordConfig = customModelBuffer 
+      ? { wakeWordModel: customModelBuffer }
+      : { manifestUrl: 'https://cdn.jsdelivr.net/gh/esphome/micro-wake-word-models@main/models/v2/okay_nabu.json' };
+
+    uwwInstance = new UWW({
+      wakeWord: wakeWordConfig,
+      mediaStream: mediaStream,
+      refractoryMs: 3000,
+    });
+
+    uwwInstance.addEventListener('wake', async (e) => {
+      console.log('唤醒词触发!', e.detail);
+      if (!isConnected.value) {
+        ElMessage.success('已唤醒！触发安全信道与声纹拦截器...');
+        await connectWebSocketAndStream();
+      }
+    });
+
+    await uwwInstance.start();
+    
   } catch (err) {
+    console.error('开启监听失败:', err);
     if (ws) ws.close();
     stopMicrophone();
   }
 }
 
+async function connectWebSocketAndStream() {
+    try {
+      await connectWebSocket();
+      
+      // websocket 建立后，开始将 PCM 流式推给后端，配合 Voiceprint Gatekeeper 进行声纹拦截
+      ensureAudioContext();
+      source = audioContext.createMediaStreamSource(mediaStream);
+      source.connect(analyser);
+
+      scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+      scriptProcessor.onaudioprocess = (event) => {
+        if (!isRecording.value || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const inputData = event.inputBuffer.getChannelData(0);
+        const pcmData = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]));
+          pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        ws.send(pcmData.buffer);
+      };
+
+      source.connect(scriptProcessor);
+      scriptProcessor.connect(audioContext.destination);
+
+      isRecording.value = true;
+    } catch (err) {
+      console.error('连接大模型信道失败', err);
+    }
+}
+
 function stopVoice() {
+  isListeningWakeWord.value = false;
+  if (uwwInstance) {
+    // 强制解除 uww.js
+    uwwInstance = null;
+  }
   stopMicrophone();
   if (ws) {
     ws.close();
@@ -132,45 +243,8 @@ function stopVoice() {
 // ---------------------------------------------------------------------------
 // 音频采集与处理
 // ---------------------------------------------------------------------------
-async function startMicrophone() {
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        sampleRate: 16000,
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-      },
-    });
-
-    ensureAudioContext();
-
-    source = audioContext.createMediaStreamSource(mediaStream);
-    source.connect(analyser);
-
-    scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-    scriptProcessor.onaudioprocess = (event) => {
-      if (!isRecording.value || !ws || ws.readyState !== WebSocket.OPEN) return;
-
-      const inputData = event.inputBuffer.getChannelData(0);
-      const pcmData = new Int16Array(inputData.length);
-      for (let i = 0; i < inputData.length; i++) {
-        const s = Math.max(-1, Math.min(1, inputData[i]));
-        pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-      }
-      ws.send(pcmData.buffer);
-    };
-
-    source.connect(scriptProcessor);
-    scriptProcessor.connect(audioContext.destination);
-
-    isRecording.value = true;
-  } catch (err) {
-    console.error('麦克风开启失败:', err);
-    ElMessage.error('开启声音采集失败，请在浏览器中允许麦克风权限');
-    throw err;
-  }
-}
+// 由于此时通过 wake-word 触发流，startMicrophone 函数已大部分合并至 startListeningWakeWord
+// 保留 stopMicrophone 以便清理资源
 
 function stopMicrophone() {
   isRecording.value = false;
@@ -308,6 +382,23 @@ function connectWebSocket() {
 
 function handleServerMessage(msg) {
   switch (msg.type) {
+    case 'auth_success':
+      ElMessage.success(msg.message || '声纹验证通过，已授权接入系统');
+      break;
+
+    case 'auth_failed':
+      ElMessage.error({
+        message: msg.message || '声纹校验未通过，识别为非授权人员，拒绝接入',
+        duration: 5000
+      });
+      // 关掉 Websocket，恢复到静默监听唤醒词状态
+      if (ws) { ws.close(); ws = null; }
+      isConnected.value = false;
+      isRecording.value = false;
+      stopAllAudioPlayback();
+      // 这里不断开麦克风，让 uww.js 继续监听下一次唤醒
+      break;
+
     case 'ready':
       break;
 
@@ -330,6 +421,14 @@ function handleServerMessage(msg) {
       if (msg.message) {
         aiReplyText.value = msg.message;
       }
+      // AI 回复完毕后，可以断开信道，进入下一次离线监听状态
+      setTimeout(() => {
+        if (ws) { ws.close(); ws = null; }
+        isConnected.value = false;
+        isRecording.value = false;
+        stopAllAudioPlayback();
+        ElMessage.info('对话结束，恢复本地静默监听');
+      }, 5000); // 留出 5 秒播放时间
       break;
 
     case 'interrupt':
@@ -405,6 +504,12 @@ onUnmounted(() => {
   animation: breathe 0.8s infinite ease-in-out;
 }
 
+.status-dot.dot-listening {
+  background-color: #e6a23c;
+  box-shadow: 0 0 8px rgba(230, 162, 60, 0.6);
+  animation: breathe 2.5s infinite ease-in-out;
+}
+
 .status-dot.dot-disconnected {
   background-color: #f56c6c;
 }
@@ -419,6 +524,19 @@ onUnmounted(() => {
   flex-direction: column;
   align-items: center;
   margin-bottom: 40px;
+}
+
+.model-settings {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.current-model-hint {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 8px;
 }
 
 .pulse-container {
