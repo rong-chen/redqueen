@@ -6,7 +6,6 @@ import VoiceLive from '../views/VoiceLive.vue';
 import ModelConfig from '../views/ModelConfig.vue';
 import MCPServers from '../views/MCPServers.vue';
 import VoiceprintEnroll from '../views/VoiceprintEnroll.vue';
-import WakeWordRecorder from '../views/WakeWordRecorder.vue';
 
 // 配置后台路由列表
 const routes = [
@@ -45,11 +44,6 @@ const routes = [
         path: 'voiceprint-enroll',
         name: 'VoiceprintEnroll',
         component: VoiceprintEnroll,
-      },
-      {
-        path: 'wakeword-recorder',
-        name: 'WakeWordRecorder',
-        component: WakeWordRecorder,
       },
     ],
   },

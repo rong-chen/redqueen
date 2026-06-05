@@ -25,10 +25,6 @@
           <el-icon><User /></el-icon>
           <span>声纹管理注册</span>
         </el-menu-item>
-        <el-menu-item index="/wakeword-recorder">
-          <el-icon><Microphone /></el-icon>
-          <span>本地唤醒词采集录音机</span>
-        </el-menu-item>
 
         <el-menu-item index="/mcp-servers">
           <el-icon><Connection /></el-icon>
@@ -102,8 +98,6 @@ const currentRouteName = computed(() => {
     return '外部 MCP 发现与服务管理看板';
   } else if (route.path === '/voiceprint-enroll') {
     return '专属唤醒声纹注册与采集';
-  } else if (route.path === '/wakeword-recorder') {
-    return '本地专属唤醒词采集录音机 (16kHz WAV)';
   } else if (route.path === '/model-config') {
     return '语音与 NLU 大模型参数配置';
   }
